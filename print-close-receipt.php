@@ -51,6 +51,14 @@ if (mysqli_num_rows($loan_result) == 0) {
 
 $loan = mysqli_fetch_assoc($loan_result);
 
+// Get jewelry return details
+$return_query = "SELECT * FROM jewelry_returns WHERE loan_id = ? ORDER BY id DESC LIMIT 1";
+$stmt = mysqli_prepare($conn, $return_query);
+mysqli_stmt_bind_param($stmt, 'i', $loan_id);
+mysqli_stmt_execute($stmt);
+$return_result = mysqli_stmt_get_result($stmt);
+$return_details = mysqli_fetch_assoc($return_result);
+
 // Get loan items (jewelry) with photos
 $items_query = "SELECT * FROM loan_items WHERE loan_id = ? ORDER BY id";
 $stmt = mysqli_prepare($conn, $items_query);
@@ -90,9 +98,9 @@ $company = mysqli_fetch_assoc($company_result);
 
 if (!$company) {
     $company = [
-        'branch_name' => 'DHARMAPURI',
-        'address' => 'DPI',
-        'phone' => '4575848575',
+        'branch_name' => 'WEALTHROT',
+        'address' => 'Main Branch',
+        'phone' => '',
         'email' => '',
         'website' => '',
         'logo_path' => '',
@@ -138,6 +146,14 @@ $total_amount_paid = $total_principal_paid + $total_interest_paid + $receipt_cha
 $customer_address = trim($loan['door_no'] . ' ' . $loan['street_name'] . ', ' . 
                      $loan['location'] . ', ' . $loan['district'] . ' - ' . 
                      $loan['pincode']);
+
+// Get collection person photo if exists
+$collection_photo_base64 = '';
+if (!empty($return_details['collection_person_photo']) && file_exists($return_details['collection_person_photo'])) {
+    $image_data = file_get_contents($return_details['collection_person_photo']);
+    $image_type = pathinfo($return_details['collection_person_photo'], PATHINFO_EXTENSION);
+    $collection_photo_base64 = 'data:image/' . $image_type . ';base64,' . base64_encode($image_data);
+}
 
 // Function to convert number to words (English)
 function numberToWords($number) {
@@ -244,23 +260,26 @@ if ($customer_photo_exists) {
 // ============================================
 // GENERATE HTML CONTENT FOR ONE RECEIPT COPY (COMPACT VERSION)
 // ============================================
-function generateReceiptHTML($company, $loan, $items, $payments, $customer_address, 
+function generateReceiptHTML($company, $loan, $items, $payments, $return_details, $customer_address, 
                               $principal, $interest_rate, $receipt_charge, $discount, $round_off,
                               $d_namuna, $others, $loan_duration_days, $loan_duration_months,
                               $loan_duration_remaining_days, $total_interest_calculated, 
                               $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-                              $customer_photo_base64, $customer_photo_exists,
+                              $customer_photo_base64, $customer_photo_exists, $collection_photo_base64,
                               $copy_type = 'ORIGINAL') {
     
     // Limit items to prevent table overflow
-    $max_items = 3; // Limited to fit two copies
+    $max_items = 5;
     $display_items = array_slice($items, 0, $max_items);
     $has_more_items = count($items) > $max_items;
     
     // Limit payments
-    $max_payments = 2; // Limited to fit two copies
+    $max_payments = 3;
     $display_payments = array_slice($payments, -$max_payments);
     $has_more_payments = count($payments) > $max_payments;
+    
+    $collection_type = $return_details['collection_type'] ?? 'customer';
+    $collection_person = $return_details['receiving_person_name'] ?? ($collection_type == 'customer' ? $loan['customer_name'] : 'N/A');
     
     $html = '<div class="receipt-wrapper">
         <div class="copy-badge">' . $copy_type . ' COPY</div>
@@ -301,7 +320,7 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
                 <div class="info-row"><span class="info-label">Guardian:</span> <span class="tamil-text">' . ($loan['guardian_type'] ? $loan['guardian_type'] . '. ' : '') . htmlspecialchars($loan['guardian_name']) . '</span></div>
                 <div class="info-row"><span class="info-label">Mobile:</span> ' . htmlspecialchars($loan['mobile_number']) . '</div>
                 <div class="info-row"><span class="info-label">Aadhaar:</span> ' . (isset($loan['aadhaar_number']) ? $loan['aadhaar_number'] : 'N/A') . '</div>
-                <div class="info-row"><span class="info-label">Address:</span> <span class="tamil-text">' . htmlspecialchars($customer_address) . '</span></div>
+                <div class="info-row"><span class="info-label">Address:</span> <span class="tamil-text">' . htmlspecialchars(substr($customer_address, 0, 60)) . '</span></div>
             </div>
         </div>';
     
@@ -319,16 +338,16 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
     
     // Jewelry Items
     $html .= '<div class="items-section">
-            <div class="section-title">JEWELRY ITEMS</div>
+            <div class="section-title">JEWELRY ITEMS RETURNED</div>
             <table class="items-table">
                 <thead>
-                    <tr>
+                     <tr>
                         <th>#</th>
-                        <th>Item (Tamil)</th>
+                        <th>Item Name</th>
                         <th>Karat</th>
                         <th>Wt(g)</th>
                         <th>Qty</th>
-                    </tr>
+                     </tr>
                 </thead>
                 <tbody>';
     
@@ -341,7 +360,7 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
                         <td>' . $item['karat'] . 'K</td>
                         <td class="text-right">' . number_format($item['net_weight'], 2) . '</td>
                         <td class="text-center">' . $item['quantity'] . '</td>
-                    </tr>';
+                     </tr>';
         }
         
         if ($has_more_items) {
@@ -355,9 +374,9 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
                 <td colspan="3" class="text-right"><strong>Total Weight:</strong></td>
                 <td class="text-right"><strong>' . number_format($total_weight, 2) . ' g</strong></td>
                 <td></td>
-            </tr>
+             </tr>
             </tbody>
-        </table>';
+         </table>';
     
     // Payment Summary
     $html .= '<div class="summary-section">
@@ -369,6 +388,18 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
     
     if ($discount > 0) {
         $html .= '<div class="summary-row"><span>Discount:</span> <span>- ₹ ' . number_format($discount, 2) . '</span></div>';
+    }
+    if ($round_off != 0) {
+        $round_sign = $round_off > 0 ? '+' : '-';
+        $html .= '<div class="summary-row"><span>Round Off:</span> <span>' . $round_sign . ' ₹ ' . number_format(abs($round_off), 2) . '</span></div>';
+    }
+    
+    // Add D. Namuna and Others if applicable
+    if ($d_namuna == 1) {
+        $html .= '<div class="summary-row"><span>D. Namuna:</span> <span>✓ Included</span></div>';
+    }
+    if ($others == 1) {
+        $html .= '<div class="summary-row"><span>Others:</span> <span>✓ Included</span></div>';
     }
     
     $html .= '<div class="summary-row total"><span>Total Paid:</span> <span>₹ ' . number_format($total_amount_paid, 2) . '</span></div>
@@ -383,6 +414,7 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
                     <thead>
                         <tr>
                             <th>Date</th>
+                            <th>Receipt</th>
                             <th>Amount</th>
                         </tr>
                     </thead>
@@ -391,18 +423,44 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
         foreach ($display_payments as $payment) {
             $html .= '<tr>
                         <td>' . date('d-m-Y', strtotime($payment['payment_date'])) . '</td>
+                        <td>' . htmlspecialchars($payment['receipt_number']) . '</td>
                         <td class="text-right">₹ ' . number_format($payment['total_amount'], 2) . '</td>
-                    </tr>';
+                     </tr>';
         }
         
         if ($has_more_payments) {
-            $html .= '<tr><td colspan="2" class="more-note">+ ' . (count($payments) - $max_payments) . ' more</td></tr>';
+            $html .= '<tr><td colspan="3" class="more-note">+ ' . (count($payments) - $max_payments) . ' more payments</td></tr>';
         }
         
         $html .= '</tbody>
-            </table>
+             </table>
         </div>';
     }
+    
+    // Collection Person Details
+    $html .= '<div class="collection-section">
+            <div class="section-title">JEWELRY COLLECTION DETAILS</div>
+            <div class="collection-info">
+                <div class="info-row"><span class="info-label">Collected By:</span> ' . htmlspecialchars($collection_person) . '</div>';
+    
+    if ($collection_type == 'other') {
+        $html .= '<div class="info-row"><span class="info-label">Relation:</span> ' . htmlspecialchars($return_details['receiving_person_relation'] ?? 'N/A') . '</div>';
+        $html .= '<div class="info-row"><span class="info-label">Mobile:</span> ' . htmlspecialchars($return_details['receiving_person_mobile'] ?? 'N/A') . '</div>';
+        $html .= '<div class="info-row"><span class="info-label">ID Proof:</span> ' . htmlspecialchars($return_details['receiving_person_id_proof'] ?? 'N/A') . '</div>';
+        
+        if (!empty($collection_photo_base64)) {
+            $html .= '<div class="collection-photo">
+                        <img src="' . $collection_photo_base64 . '" class="collection-person-photo" alt="Collection Person Photo">
+                      </div>';
+        }
+    }
+    
+    $html .= '<div class="info-row"><span class="info-label">Verified:</span> ';
+    if ($return_details['signature_verified'] ?? 0) $html .= '✓ Signature ';
+    if ($return_details['id_proof_verified'] ?? 0) $html .= '✓ ID Proof ';
+    $html .= '</div>
+            </div>
+        </div>';
     
     // Amount in Words
     $html .= '<div class="amount-words">
@@ -411,7 +469,7 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
     
     // Settlement Note
     $html .= '<div class="settlement-note">
-            ✓ LOAN SETTLED on ' . date('d-m-Y', strtotime($loan['close_date'])) . ' ✓
+            ✓ LOAN FULLY SETTLED & JEWELRY RETURNED on ' . date('d-m-Y', strtotime($loan['close_date'])) . ' ✓
         </div>';
     
     // Signature
@@ -422,7 +480,7 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
     
     // Footer
     $html .= '<div class="footer">
-            ' . date('d-m-Y H:i') . ' | ' . $copy_type . ' COPY
+            Generated: ' . date('d-m-Y H:i') . ' | ' . $copy_type . ' COPY | Thank You!
         </div>
     </div>';
     
@@ -432,12 +490,12 @@ function generateReceiptHTML($company, $loan, $items, $payments, $customer_addre
 // ============================================
 // GENERATE HTML CONTENT FOR TWO COPIES ON ONE PAGE
 // ============================================
-function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_address, 
+function generateTwoCopyHTML($company, $loan, $items, $payments, $return_details, $customer_address, 
                               $principal, $interest_rate, $receipt_charge, $discount, $round_off,
                               $d_namuna, $others, $loan_duration_days, $loan_duration_months,
                               $loan_duration_remaining_days, $total_interest_calculated, 
                               $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-                              $customer_photo_base64, $customer_photo_exists) {
+                              $customer_photo_base64, $customer_photo_exists, $collection_photo_base64) {
     
     $html = '<!DOCTYPE html>
 <html>
@@ -451,7 +509,7 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         }
         
         body {
-            font-family: "Latha", "Tamil MN", "Lohit Tamil", "Noto Sans Tamil", Arial, sans-serif;
+            font-family: "Segoe UI", "Latha", "Tamil MN", "Lohit Tamil", "Noto Sans Tamil", Arial, sans-serif;
             font-size: 8pt;
             line-height: 1.2;
             margin: 0;
@@ -468,47 +526,48 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         
         .receipt-wrapper {
             border: 1px solid #ddd;
-            padding: 4px;
-            margin-bottom: 5px;
+            padding: 6px;
+            margin-bottom: 6px;
             page-break-inside: avoid;
+            background: white;
         }
         
         .copy-badge {
             text-align: right;
             font-size: 7pt;
             font-weight: bold;
-            color: #666;
+            color: #48bb78;
             border-bottom: 1px dashed #ccc;
-            margin-bottom: 3px;
+            margin-bottom: 4px;
             padding-bottom: 2px;
         }
         
         .header {
             display: flex;
             align-items: center;
-            margin-bottom: 4px;
+            margin-bottom: 5px;
         }
         
         .logo-container {
-            width: 30px;
-            height: 30px;
-            margin-right: 5px;
+            width: 35px;
+            height: 35px;
+            margin-right: 6px;
         }
         
         .logo {
-            width: 30px;
-            height: 30px;
+            width: 35px;
+            height: 35px;
             object-fit: contain;
         }
         
         .no-logo {
-            width: 30px;
-            height: 30px;
+            width: 35px;
+            height: 35px;
             background: #f0f0f0;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 6pt;
+            font-size: 7pt;
             color: #999;
         }
         
@@ -518,18 +577,19 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         }
         
         .company-name {
-            font-size: 10pt;
+            font-size: 11pt;
             font-weight: bold;
+            color: #2d3748;
         }
         
         .receipt-title {
-            font-size: 9pt;
+            font-size: 10pt;
             color: #48bb78;
             font-weight: bold;
         }
         
         .receipt-subtitle {
-            font-size: 6pt;
+            font-size: 7pt;
             color: #666;
         }
         
@@ -537,63 +597,65 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
             font-size: 8pt;
             font-weight: bold;
             background: #f0f0f0;
-            padding: 2px 4px;
-            margin: 4px 0 2px 0;
-            border-left: 3px solid #48bb78;
+            padding: 3px 6px;
+            margin: 5px 0 3px 0;
+            border-left: 4px solid #48bb78;
         }
         
         .customer-section {
-            margin-bottom: 4px;
+            margin-bottom: 5px;
         }
         
         .customer-photo-row {
             display: flex;
-            gap: 5px;
+            gap: 6px;
         }
         
         .photo-container {
-            width: 45px;
-            height: 45px;
+            width: 55px;
+            height: 55px;
             border: 1px solid #ddd;
+            border-radius: 4px;
+            overflow: hidden;
         }
         
         .customer-photo {
-            width: 43px;
-            height: 43px;
+            width: 53px;
+            height: 53px;
             object-fit: cover;
         }
         
         .no-photo {
-            width: 43px;
-            height: 43px;
+            width: 53px;
+            height: 53px;
             background: #f9f9f9;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 6pt;
+            font-size: 7pt;
             color: #999;
         }
         
         .customer-info {
             flex: 1;
-            font-size: 7pt;
+            font-size: 7.5pt;
         }
         
         .loan-info-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
-            gap: 2px 5px;
-            font-size: 7pt;
-            margin-bottom: 4px;
+            gap: 3px 8px;
+            font-size: 7.5pt;
+            margin-bottom: 5px;
         }
         
         .info-row {
             display: flex;
-            margin-bottom: 1px;
+            margin-bottom: 2px;
         }
         
         .info-label {
-            width: 55px;
+            width: 65px;
             font-weight: bold;
             color: #555;
         }
@@ -601,19 +663,19 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         .items-table, .history-table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 6.5pt;
-            margin-bottom: 4px;
+            font-size: 7pt;
+            margin-bottom: 5px;
         }
         
         .items-table th, .history-table th {
             background: #f5f5f5;
-            padding: 2px;
+            padding: 3px;
             border: 1px solid #ddd;
             text-align: left;
         }
         
         .items-table td, .history-table td {
-            padding: 1px 2px;
+            padding: 2px 3px;
             border: 1px solid #ddd;
         }
         
@@ -632,68 +694,93 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         
         .summary-box {
             border: 1px solid #ddd;
-            padding: 3px;
-            margin-bottom: 4px;
-            font-size: 7pt;
+            padding: 4px;
+            margin-bottom: 5px;
+            font-size: 7.5pt;
         }
         
         .summary-row {
             display: flex;
             justify-content: space-between;
-            padding: 1px 0;
+            padding: 2px 0;
             border-bottom: 1px dashed #eee;
         }
         
         .summary-row.total {
-            border-top: 1px solid #48bb78;
+            border-top: 2px solid #48bb78;
             border-bottom: none;
-            margin-top: 2px;
-            padding-top: 2px;
+            margin-top: 3px;
+            padding-top: 3px;
             font-weight: bold;
+            font-size: 8pt;
+        }
+        
+        .collection-section {
+            margin-bottom: 5px;
+        }
+        
+        .collection-info {
+            font-size: 7.5pt;
+            padding: 3px;
+        }
+        
+        .collection-photo {
+            margin-top: 5px;
+            text-align: center;
+        }
+        
+        .collection-person-photo {
+            width: 50px;
+            height: 50px;
+            border-radius: 8px;
+            object-fit: cover;
+            border: 1px solid #ddd;
         }
         
         .amount-words {
-            font-size: 6.5pt;
+            font-size: 7pt;
             background: #ebf4ff;
-            padding: 2px 4px;
-            margin: 4px 0;
-            border-left: 3px solid #48bb78;
+            padding: 3px 6px;
+            margin: 5px 0;
+            border-left: 4px solid #48bb78;
         }
         
         .settlement-note {
             text-align: center;
-            font-size: 7pt;
+            font-size: 8pt;
             font-weight: bold;
             color: #48bb78;
-            margin: 4px 0;
+            margin: 5px 0;
+            background: #e6fffa;
+            padding: 3px;
         }
         
         .signature-section {
             display: flex;
             justify-content: space-between;
-            margin-top: 6px;
-            font-size: 6pt;
+            margin-top: 8px;
+            font-size: 7pt;
         }
         
         .signature-box {
             width: 45%;
             text-align: center;
             border-top: 1px solid #000;
-            padding-top: 2px;
-            margin-top: 5px;
+            padding-top: 3px;
+            margin-top: 6px;
         }
         
         .footer {
             text-align: center;
-            font-size: 5pt;
+            font-size: 6pt;
             color: #999;
-            margin-top: 3px;
-            padding-top: 2px;
+            margin-top: 4px;
+            padding-top: 3px;
             border-top: 1px solid #eee;
         }
         
         .more-note {
-            font-size: 5pt;
+            font-size: 6pt;
             color: #999;
             font-style: italic;
             text-align: center;
@@ -705,9 +792,9 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
         
         .cut-line {
             text-align: center;
-            margin: 2px 0;
+            margin: 3px 0;
             color: #999;
-            font-size: 7pt;
+            font-size: 8pt;
         }
         
         .cut-line:before, .cut-line:after {
@@ -717,36 +804,41 @@ function generateTwoCopyHTML($company, $loan, $items, $payments, $customer_addre
             height: 1px;
             background: #ccc;
             vertical-align: middle;
-            margin: 0 3px;
+            margin: 0 5px;
         }
         
         @media print {
             .cut-line {
                 opacity: 0.3;
             }
+            .receipt-wrapper {
+                break-inside: avoid;
+            }
         }
     </style>
 </head>
 <body>
     <div class="page">
-        <!-- First Copy -->
-        ' . generateReceiptHTML($company, $loan, $items, $payments, $customer_address,
+        <!-- First Copy - ORIGINAL -->
+        ' . generateReceiptHTML($company, $loan, $items, $payments, $return_details, $customer_address,
                               $principal, $interest_rate, $receipt_charge, $discount, $round_off,
                               $d_namuna, $others, $loan_duration_days, $loan_duration_months,
                               $loan_duration_remaining_days, $total_interest_calculated, 
                               $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-                              $customer_photo_base64, $customer_photo_exists, 'ORIGINAL') . '
+                              $customer_photo_base64, $customer_photo_exists, $collection_photo_base64,
+                              'ORIGINAL') . '
         
         <!-- Cut Line -->
         <div class="cut-line">✂ - - - - - CUT HERE - - - - - ✂</div>
         
-        <!-- Second Copy -->
-        ' . generateReceiptHTML($company, $loan, $items, $payments, $customer_address,
+        <!-- Second Copy - DUPLICATE -->
+        ' . generateReceiptHTML($company, $loan, $items, $payments, $return_details, $customer_address,
                               $principal, $interest_rate, $receipt_charge, $discount, $round_off,
                               $d_namuna, $others, $loan_duration_days, $loan_duration_months,
                               $loan_duration_remaining_days, $total_interest_calculated, 
                               $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-                              $customer_photo_base64, $customer_photo_exists, 'DUPLICATE') . '
+                              $customer_photo_base64, $customer_photo_exists, $collection_photo_base64,
+                              'DUPLICATE') . '
     </div>
 </body>
 </html>';
@@ -771,12 +863,12 @@ if ($action === 'download' || $action === 'print') {
             
             // Generate HTML content with two copies
             $html = generateTwoCopyHTML(
-                $company, $loan, $items, $payments, $customer_address,
+                $company, $loan, $items, $payments, $return_details, $customer_address,
                 $principal, $interest_rate, $receipt_charge, $discount, $round_off,
                 $d_namuna, $others, $loan_duration_days, $loan_duration_months,
                 $loan_duration_remaining_days, $total_interest_calculated,
                 $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-                $customer_photo_base64, $customer_photo_exists
+                $customer_photo_base64, $customer_photo_exists, $collection_photo_base64
             );
             
             // Create mPDF instance with UTF-8 support
@@ -817,12 +909,12 @@ if ($action === 'download' || $action === 'print') {
 // HTML PREVIEW WITH TWO COPIES
 // ============================================
 $preview_html = generateTwoCopyHTML(
-    $company, $loan, $items, $payments, $customer_address,
+    $company, $loan, $items, $payments, $return_details, $customer_address,
     $principal, $interest_rate, $receipt_charge, $discount, $round_off,
     $d_namuna, $others, $loan_duration_days, $loan_duration_months,
     $loan_duration_remaining_days, $total_interest_calculated,
     $total_amount_paid, $total_weight, $logo_base64, $logo_exists,
-    $customer_photo_base64, $customer_photo_exists
+    $customer_photo_base64, $customer_photo_exists, $collection_photo_base64
 );
 ?>
 <!DOCTYPE html>
@@ -840,67 +932,80 @@ $preview_html = generateTwoCopyHTML(
         }
 
         body {
-            font-family: "Latha", "Tamil MN", "Lohit Tamil", "Noto Sans Tamil", Arial, sans-serif;
+            font-family: "Segoe UI", "Latha", "Tamil MN", "Lohit Tamil", "Noto Sans Tamil", Arial, sans-serif;
             background: #f8fafc;
-            padding: 15px;
+            padding: 20px;
         }
 
         .preview-container {
-            max-width: 900px;
+            max-width: 1000px;
             margin: 0 auto;
         }
 
         .action-bar {
             background: white;
-            border-radius: 6px;
-            padding: 10px;
-            margin-bottom: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-radius: 8px;
+            padding: 15px 20px;
+            margin-bottom: 15px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
-            gap: 8px;
+            gap: 10px;
+        }
+
+        .receipt-info {
+            font-size: 14px;
+        }
+
+        .receipt-info strong {
+            color: #48bb78;
         }
 
         .action-buttons {
             display: flex;
-            gap: 6px;
+            gap: 10px;
         }
 
         .btn {
-            padding: 6px 12px;
-            border-radius: 4px;
-            font-size: 12px;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
             font-weight: 500;
             cursor: pointer;
             border: none;
             display: inline-flex;
             align-items: center;
-            gap: 4px;
+            gap: 6px;
             text-decoration: none;
+            transition: all 0.3s;
         }
 
         .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a67d8; transform: translateY(-1px); }
         .btn-success { background: #48bb78; color: white; }
+        .btn-success:hover { background: #38a169; transform: translateY(-1px); }
         .btn-secondary { background: #a0aec0; color: white; }
+        .btn-secondary:hover { background: #718096; }
         .btn-warning { background: #ecc94b; color: #744210; }
-
-        .receipt-preview {
-            background: white;
-            border-radius: 6px;
-            padding: 10px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            margin-bottom: 10px;
-        }
+        .btn-warning:hover { background: #d69e2e; }
 
         .note-box {
             background: #ebf8ff;
-            border-left: 3px solid #4299e1;
-            padding: 8px 12px;
-            margin-bottom: 10px;
-            border-radius: 4px;
-            font-size: 12px;
+            border-left: 4px solid #4299e1;
+            padding: 12px 16px;
+            margin-bottom: 15px;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .receipt-preview {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
         }
 
         @media print {
@@ -910,6 +1015,11 @@ $preview_html = generateTwoCopyHTML(
             .receipt-preview {
                 box-shadow: none;
                 padding: 0;
+                margin: 0;
+            }
+            body {
+                background: white;
+                padding: 0;
             }
         }
     </style>
@@ -918,8 +1028,11 @@ $preview_html = generateTwoCopyHTML(
     <div class="preview-container">
         <!-- Action Bar -->
         <div class="action-bar">
-            <div>
-                <strong>Receipt: <?php echo htmlspecialchars($loan['receipt_number']); ?></strong> - Two Copies on One Page
+            <div class="receipt-info">
+                <i class="bi bi-receipt"></i> 
+                <strong>Receipt: <?php echo htmlspecialchars($loan['receipt_number']); ?></strong> | 
+                Customer: <?php echo htmlspecialchars($loan['customer_name']); ?> |
+                Closed: <?php echo date('d-m-Y', strtotime($loan['close_date'])); ?>
             </div>
             <div class="action-buttons">
                 <a href="close-loan-receipt-notes.php" class="btn btn-secondary">
@@ -928,7 +1041,7 @@ $preview_html = generateTwoCopyHTML(
                 
                 <?php if (file_exists(__DIR__ . '/vendor/autoload.php')): ?>
                 <a href="?id=<?php echo $loan_id; ?>&action=download" class="btn btn-success">
-                    <i class="bi bi-file-pdf"></i> PDF
+                    <i class="bi bi-file-pdf"></i> Download PDF
                 </a>
                 <?php endif; ?>
                 
@@ -940,7 +1053,14 @@ $preview_html = generateTwoCopyHTML(
 
         <!-- Note -->
         <div class="note-box">
-            <i class="bi bi-info-circle"></i> This will print as ONE page with TWO receipts (Original & Duplicate)
+            <i class="bi bi-info-circle-fill"></i> 
+            This receipt contains <strong>TWO COPIES</strong> on a single page - Original (Top) and Duplicate (Bottom).
+            <?php if ($d_namuna == 1 || $others == 1): ?>
+            <br><i class="bi bi-tag"></i> 
+            <strong>Additional Charges:</strong>
+            <?php if ($d_namuna == 1): ?> ✓ D. Namuna <?php endif; ?>
+            <?php if ($others == 1): ?> ✓ Others <?php endif; ?>
+            <?php endif; ?>
         </div>
 
         <!-- Receipt Preview -->

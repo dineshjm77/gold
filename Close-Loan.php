@@ -17,7 +17,6 @@ $error = '';
 $loan = null;
 $customer = null;
 $loan_id = 0;
-$receiving_person = null;
 
 // Get receiving persons (employees who can receive jewelry)
 $receiving_persons_query = "SELECT id, name, role FROM users WHERE status = 'active' AND (role = 'admin' OR role = 'sale' OR role = 'manager' OR role = 'accountant') ORDER BY name";
@@ -31,6 +30,14 @@ $employees_result = mysqli_query($conn, $employees_query);
 $check_columns_query = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
 $check_columns_result = mysqli_query($conn, $check_columns_query);
 $has_remaining_column = (mysqli_num_rows($check_columns_result) > 0);
+
+// Check and add collection_person_photo column if needed
+$check_photo_column = "SHOW COLUMNS FROM jewelry_returns LIKE 'collection_person_photo'";
+$photo_col_result = mysqli_query($conn, $check_photo_column);
+if (mysqli_num_rows($photo_col_result) == 0) {
+    $add_photo_column = "ALTER TABLE jewelry_returns ADD COLUMN collection_person_photo VARCHAR(255) DEFAULT NULL AFTER receiving_person_id_proof";
+    mysqli_query($conn, $add_photo_column);
+}
 
 // Handle AJAX search request for live search
 if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
@@ -366,6 +373,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $receiving_person_relation = '';
         $receiving_person_mobile = '';
         $receiving_person_id_proof = '';
+        $other_person_photo = '';
         $receiving_person_signature = isset($_POST['signature_verified']) ? 1 : 0;
         $id_proof_verified = isset($_POST['id_proof_verified']) ? 1 : 0;
         
@@ -379,6 +387,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $receiving_person_relation = mysqli_real_escape_string($conn, $_POST['other_person_relation'] ?? '');
             $receiving_person_mobile = mysqli_real_escape_string($conn, $_POST['other_person_mobile'] ?? '');
             $receiving_person_id_proof = mysqli_real_escape_string($conn, $_POST['other_person_id_proof'] ?? '');
+            $other_person_photo = $_POST['other_person_photo'] ?? '';
             
             if (empty($receiving_person_name)) {
                 $error = "Please enter the name of the person collecting the jewelry";
@@ -391,6 +400,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             mysqli_begin_transaction($conn);
             
             try {
+                // Save other person photo if provided
+                $saved_photo_path = '';
+                if (!empty($other_person_photo) && strpos($other_person_photo, 'data:image') === 0) {
+                    $upload_dir = __DIR__ . '/uploads/collection_persons/';
+                    if (!file_exists($upload_dir)) {
+                        mkdir($upload_dir, 0777, true);
+                    }
+                    
+                    $photo_data = explode(',', $other_person_photo);
+                    if (count($photo_data) > 1) {
+                        $photo_binary = base64_decode($photo_data[1]);
+                        $filename = 'collection_' . $loan_id . '_' . time() . '.jpg';
+                        $filepath = $upload_dir . $filename;
+                        file_put_contents($filepath, $photo_binary);
+                        $saved_photo_path = 'uploads/collection_persons/' . $filename;
+                    }
+                }
+                
                 $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
                 $receipt_result = mysqli_query($conn, $receipt_query);
                 $receipt_count = mysqli_fetch_assoc($receipt_result)['count'] + 1;
@@ -419,16 +446,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $insert_return = "INSERT INTO jewelry_returns (
                     loan_id, loan_receipt_number, customer_id, customer_name,
                     return_date, collection_type, receiving_person_name, receiving_person_relation,
-                    receiving_person_mobile, receiving_person_id_proof, signature_verified, 
-                    id_proof_verified, remarks, created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    receiving_person_mobile, receiving_person_id_proof, collection_person_photo,
+                    signature_verified, id_proof_verified, remarks, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
                 
                 $stmt = mysqli_prepare($conn, $insert_return);
-                mysqli_stmt_bind_param($stmt, 'isississssissi', 
+                mysqli_stmt_bind_param($stmt, 'isississsssissi', 
                     $loan_id, $loan['receipt_number'], $customer['id'], $customer['name'],
                     $close_date, $collection_type, $receiving_person_name, $receiving_person_relation,
-                    $receiving_person_mobile, $receiving_person_id_proof, $receiving_person_signature, 
-                    $id_proof_verified, $remarks, $employee_id
+                    $receiving_person_mobile, $receiving_person_id_proof, $saved_photo_path,
+                    $receiving_person_signature, $id_proof_verified, $remarks, $employee_id
                 );
                 
                 if (!mysqli_stmt_execute($stmt)) {
@@ -494,11 +521,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                         'customer_email' => $customer['email'],
                         'loan_receipt' => $loan['receipt_number'],
                         'close_date' => $close_date,
-                        'remaining_principal' => $remaining_principal,
-                        'interest_paid' => $payable_interest,
+                        'remaining_principal' => $final_principal,
+                        'interest_paid' => $final_interest,
                         'total_paid' => $total_amount,
                         'collection_type' => $collection_type,
                         'collection_person' => $receiving_person_name,
+                        'receiving_person' => $receiving_person_name,
                         'items_count' => count($items),
                         'items' => $items
                     ];
@@ -1012,12 +1040,6 @@ $total_data = mysqli_fetch_assoc($total_result);
             box-shadow: 0 4px 15px rgba(72, 187, 120, 0.4);
         }
 
-        .action-btn.receipt {
-            background: #ecc94b;
-            color: white;
-            box-shadow: 0 4px 15px rgba(236, 201, 75, 0.4);
-        }
-
         .modal {
             display: none;
             position: fixed;
@@ -1203,6 +1225,19 @@ $total_data = mysqli_fetch_assoc($total_result);
         .spin {
             animation: spin 1s linear infinite;
             display: inline-block;
+        }
+
+        .camera-preview {
+            width: 100%;
+            max-width: 400px;
+            margin: 0 auto;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        video, canvas, img {
+            width: 100%;
+            border-radius: 8px;
         }
 
         @media (max-width: 1200px) {
@@ -1468,7 +1503,7 @@ $total_data = mysqli_fetch_assoc($total_result);
                                     foreach ($items as $item): 
                                         $total_qty += $item['quantity'];
                                     ?>
-                                    <tr>
+                                     <tr>
                                         <td><?php echo $sno++; ?></td>
                                         <td><?php echo htmlspecialchars($item['jewel_name']); ?></td>
                                         <td><?php echo htmlspecialchars($item['defect_details'] ?: '-'); ?></td>
@@ -1502,7 +1537,7 @@ $total_data = mysqli_fetch_assoc($total_result);
                             
                             <table class="items-table">
                                 <thead>
-                                    <tr>
+                                     <tr>
                                         <th>Date</th>
                                         <th>Receipt No</th>
                                         <th>Principal (₹)</th>
@@ -1694,6 +1729,15 @@ $total_data = mysqli_fetch_assoc($total_result);
                             <label class="form-label">ID Proof Number</label>
                             <input type="text" class="form-control" name="other_person_id_proof" id="other_person_id_proof" placeholder="Aadhaar, Voter ID, etc.">
                         </div>
+                        
+                        <div class="form-group" id="cameraButtonDiv">
+                            <label class="form-label">Person Photo</label>
+                            <button type="button" class="btn btn-primary" onclick="openCameraModal()" style="width: 100%;">
+                                <i class="bi bi-camera"></i> Take Photo
+                            </button>
+                            <div id="otherPersonPhotoThumbnail" style="margin-top: 10px; text-align: center;"></div>
+                            <input type="hidden" name="other_person_photo" id="other_person_photo" value="">
+                        </div>
                     </div>
                     
                     <div class="options-row">
@@ -1721,6 +1765,37 @@ $total_data = mysqli_fetch_assoc($total_result);
         </div>
     </div>
 
+    <!-- Camera Modal -->
+    <div class="modal" id="cameraModal">
+        <div class="modal-content" style="max-width: 500px;">
+            <span class="modal-close" onclick="closeCameraModal()">&times;</span>
+            <h3 class="modal-title">Take Photo of Person Collecting Jewelry</h3>
+            
+            <div style="text-align: center; margin: 20px 0;">
+                <video id="video" width="100%" height="auto" autoplay style="border-radius: 12px; border: 2px solid #667eea;"></video>
+                <canvas id="canvas" style="display: none;"></canvas>
+                <img id="photoPreview" style="display: none; width: 100%; border-radius: 12px; margin-top: 10px;">
+            </div>
+            
+            <div style="display: flex; gap: 10px; justify-content: center;">
+                <button type="button" class="btn btn-primary" id="captureBtn" onclick="capturePhoto()">
+                    <i class="bi bi-camera"></i> Capture Photo
+                </button>
+                <button type="button" class="btn btn-secondary" id="retakeBtn" onclick="retakePhoto()" style="display: none;">
+                    <i class="bi bi-arrow-repeat"></i> Retake
+                </button>
+                <button type="button" class="btn btn-success" id="savePhotoBtn" onclick="savePhoto()" style="display: none;">
+                    <i class="bi bi-check-lg"></i> Save Photo
+                </button>
+            </div>
+            
+            <div class="form-group" style="margin-top: 20px;">
+                <label class="form-label">Photo Status</label>
+                <div id="photoStatus"></div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
     <script>
         // Initialize date pickers
@@ -1732,6 +1807,102 @@ $total_data = mysqli_fetch_assoc($total_result);
         let remainingPrincipal = <?php echo $remaining_principal ?? 0; ?>;
         let payableInterest = <?php echo $payable_interest ?? 0; ?>;
         let receiptCharge = <?php echo $loan['receipt_charge'] ?? 0; ?>;
+
+        // Camera functionality
+        let stream = null;
+        let capturedPhotoData = null;
+
+        function openCameraModal() {
+            const modal = document.getElementById('cameraModal');
+            modal.classList.add('active');
+            
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ video: true })
+                    .then(function(mediaStream) {
+                        stream = mediaStream;
+                        const video = document.getElementById('video');
+                        video.srcObject = stream;
+                        video.play();
+                        
+                        document.getElementById('captureBtn').style.display = 'inline-block';
+                        document.getElementById('retakeBtn').style.display = 'none';
+                        document.getElementById('savePhotoBtn').style.display = 'none';
+                        document.getElementById('photoPreview').style.display = 'none';
+                        document.getElementById('video').style.display = 'block';
+                    })
+                    .catch(function(err) {
+                        console.error("Camera error: " + err);
+                        alert("Unable to access camera. Please make sure you have granted camera permissions.");
+                    });
+            } else {
+                alert("Camera not supported on this device.");
+            }
+        }
+
+        function capturePhoto() {
+            const video = document.getElementById('video');
+            const canvas = document.getElementById('canvas');
+            const context = canvas.getContext('2d');
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            
+            context.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            capturedPhotoData = canvas.toDataURL('image/jpeg', 0.8);
+            
+            const photoPreview = document.getElementById('photoPreview');
+            photoPreview.src = capturedPhotoData;
+            photoPreview.style.display = 'block';
+            
+            document.getElementById('video').style.display = 'none';
+            document.getElementById('captureBtn').style.display = 'none';
+            document.getElementById('retakeBtn').style.display = 'inline-block';
+            document.getElementById('savePhotoBtn').style.display = 'inline-block';
+            
+            document.getElementById('photoStatus').innerHTML = '<span style="color: #48bb78;"><i class="bi bi-check-circle"></i> Photo captured successfully!</span>';
+        }
+
+        function retakePhoto() {
+            document.getElementById('video').style.display = 'block';
+            document.getElementById('photoPreview').style.display = 'none';
+            document.getElementById('captureBtn').style.display = 'inline-block';
+            document.getElementById('retakeBtn').style.display = 'none';
+            document.getElementById('savePhotoBtn').style.display = 'none';
+            document.getElementById('photoStatus').innerHTML = '';
+            capturedPhotoData = null;
+        }
+
+        function savePhoto() {
+            if (capturedPhotoData) {
+                document.getElementById('other_person_photo').value = capturedPhotoData;
+                document.getElementById('photoStatus').innerHTML = '<span style="color: #48bb78;"><i class="bi bi-check-circle-fill"></i> Photo saved!</span>';
+                
+                const thumbnailDiv = document.getElementById('otherPersonPhotoThumbnail');
+                if (thumbnailDiv) {
+                    thumbnailDiv.innerHTML = '<img src="' + capturedPhotoData + '" style="width: 80px; height: 80px; border-radius: 8px; object-fit: cover; border: 2px solid #48bb78;">';
+                }
+                
+                setTimeout(() => {
+                    closeCameraModal();
+                }, 1500);
+            }
+        }
+
+        function closeCameraModal() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            
+            document.getElementById('cameraModal').classList.remove('active');
+            document.getElementById('video').style.display = 'block';
+            document.getElementById('photoPreview').style.display = 'none';
+            document.getElementById('captureBtn').style.display = 'inline-block';
+            document.getElementById('retakeBtn').style.display = 'none';
+            document.getElementById('savePhotoBtn').style.display = 'none';
+            document.getElementById('photoStatus').innerHTML = '';
+        }
 
         // Live Search Functionality
         let searchTimeout;
@@ -1776,8 +1947,6 @@ $total_data = mysqli_fetch_assoc($total_result);
                     fetch(`close-loan.php?ajax_search=1&term=${encodeURIComponent(term)}`)
                         .then(response => response.json())
                         .then(data => {
-                            console.log('Search response:', data);
-                            
                             if (data.error) {
                                 searchResults.innerHTML = `<div class="no-results"><i class="bi bi-exclamation-circle"></i><br>${data.error}</div>`;
                                 searchStats.textContent = 'Error searching';
@@ -1916,24 +2085,21 @@ $total_data = mysqli_fetch_assoc($total_result);
         function setCollectionType(type) {
             document.getElementById('collection_type').value = type;
             
-            const customerBtn = document.querySelector('.collection-type-btn:first-child');
-            const otherBtn = document.querySelector('.collection-type-btn:last-child');
+            const customerBtn = document.querySelectorAll('.collection-type-btn')[0];
+            const otherBtn = document.querySelectorAll('.collection-type-btn')[1];
             const otherFields = document.getElementById('otherPersonFields');
+            const cameraButtonDiv = document.getElementById('cameraButtonDiv');
             
             if (type === 'customer') {
                 customerBtn.classList.add('active');
                 otherBtn.classList.remove('active');
                 otherFields.classList.remove('show');
-                
-                // Clear other person fields
-                if (document.getElementById('other_person_name')) document.getElementById('other_person_name').value = '';
-                if (document.getElementById('other_person_relation')) document.getElementById('other_person_relation').value = '';
-                if (document.getElementById('other_person_mobile')) document.getElementById('other_person_mobile').value = '';
-                if (document.getElementById('other_person_id_proof')) document.getElementById('other_person_id_proof').value = '';
+                if (cameraButtonDiv) cameraButtonDiv.style.display = 'none';
             } else {
                 customerBtn.classList.remove('active');
                 otherBtn.classList.add('active');
                 otherFields.classList.add('show');
+                if (cameraButtonDiv) cameraButtonDiv.style.display = 'block';
             }
         }
 
@@ -1941,9 +2107,11 @@ $total_data = mysqli_fetch_assoc($total_result);
         window.onclick = function(event) {
             const advanceModal = document.getElementById('advanceModal');
             const closeModal = document.getElementById('closeModal');
+            const cameraModal = document.getElementById('cameraModal');
             
             if (event.target == advanceModal) hideAdvanceModal();
             if (event.target == closeModal) hideCloseModal();
+            if (event.target == cameraModal) closeCameraModal();
         }
 
         // Auto-hide alerts after 5 seconds
