@@ -6,7 +6,16 @@ require_once 'includes/db.php';
 require_once 'auth_check.php';
 require_once 'includes/email_helper.php';
 
-// Check if user has permission (admin or sale, accountant)
+// Enable error reporting for debugging (disable in production)
+error_reporting(E_ALL);
+ini_set('display_errors', 0); // Don't display errors, log them
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error_log.txt');
+
+// Set UTF-8
+header('Content-Type: text/html; charset=utf-8');
+
+// Check if user has permission
 if (!in_array($_SESSION['user_role'], ['admin', 'sale', 'accountant'])) {
     header('Location: index.php');
     exit();
@@ -18,7 +27,12 @@ $loan = null;
 $customer = null;
 $loan_id = 0;
 
-// Get receiving persons (employees who can receive jewelry)
+// Check database connection
+if (!$conn) {
+    die("Database connection failed");
+}
+
+// Get receiving persons
 $receiving_persons_query = "SELECT id, name, role FROM users WHERE status = 'active' AND (role = 'admin' OR role = 'sale' OR role = 'manager' OR role = 'accountant') ORDER BY name";
 $receiving_persons_result = mysqli_query($conn, $receiving_persons_query);
 
@@ -41,16 +55,35 @@ if (mysqli_num_rows($photo_col_result) == 0) {
 
 // Handle AJAX search request for live search
 if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
+    // Set JSON header
     header('Content-Type: application/json');
-    $search_term = mysqli_real_escape_string($conn, $_GET['term']);
+    
+    // Get and sanitize search term
+    $search_term = trim($_GET['term']);
+    
+    // Log search attempt
+    error_log("AJAX Search: " . $search_term);
+    
+    if (strlen($search_term) < 2) {
+        echo json_encode([
+            'results' => [],
+            'count' => 0,
+            'message' => 'Please enter at least 2 characters',
+            'open_loans_count' => 0
+        ]);
+        exit();
+    }
+    
+    // Escape search term
+    $search_term = mysqli_real_escape_string($conn, $search_term);
     $search_term_like = '%' . $search_term . '%';
     
-    // Check open loans count first
+    // Check open loans count
     $count_query = "SELECT COUNT(*) as count FROM loans WHERE status = 'open'";
     $count_result = mysqli_query($conn, $count_query);
-    $open_loans_count = mysqli_fetch_assoc($count_result)['count'];
+    $open_loans_count = $count_result ? mysqli_fetch_assoc($count_result)['count'] : 0;
     
-    // Use the same query structure as loan-collection.php
+    // Build search query (using direct query instead of prepared statement for better compatibility)
     if ($has_remaining_column) {
         $ajax_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
                        COALESCE(l.remaining_principal, l.loan_amount) as remaining_principal,
@@ -62,7 +95,9 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
                        FROM loans l
                        JOIN customers c ON l.customer_id = c.id
                        WHERE l.status = 'open' 
-                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       AND (l.receipt_number LIKE '$search_term_like' 
+                            OR c.customer_name LIKE '$search_term_like' 
+                            OR c.mobile_number LIKE '$search_term_like')
                        ORDER BY l.receipt_date DESC
                        LIMIT 50";
     } else {
@@ -76,56 +111,61 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
                        FROM loans l
                        JOIN customers c ON l.customer_id = c.id
                        WHERE l.status = 'open' 
-                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       AND (l.receipt_number LIKE '$search_term_like' 
+                            OR c.customer_name LIKE '$search_term_like' 
+                            OR c.mobile_number LIKE '$search_term_like')
                        ORDER BY l.receipt_date DESC
                        LIMIT 50";
     }
     
-    $stmt = mysqli_prepare($conn, $ajax_query);
-    if ($stmt) {
-        mysqli_stmt_bind_param($stmt, 'sss', $search_term_like, $search_term_like, $search_term_like);
-        mysqli_stmt_execute($stmt);
-        $result = mysqli_stmt_get_result($stmt);
-        
-        $loans = [];
-        while ($row = mysqli_fetch_assoc($result)) {
-            // Determine match type
-            $match_type = 'partial';
-            if (stripos($row['receipt_number'], $search_term) === 0) {
-                $match_type = 'receipt_start';
-            } elseif (stripos($row['customer_name'], $search_term) === 0) {
-                $match_type = 'name_start';
-            } elseif ($row['receipt_number'] == $search_term) {
-                $match_type = 'exact';
-            }
-            
-            $loans[] = [
-                'id' => $row['id'],
-                'receipt_number' => $row['receipt_number'],
-                'customer_name' => $row['customer_name'],
-                'mobile' => $row['mobile_number'],
-                'loan_amount' => round(floatval($row['loan_amount']), 2),
-                'remaining_principal' => round(floatval($row['remaining_principal']), 2),
-                'pending_interest' => round(floatval($row['pending_interest']), 2),
-                'interest_rate' => $row['interest_amount'],
-                'overdue_amount' => round(floatval($row['total_overdue_amount']), 2),
-                'match_type' => $match_type
-            ];
-        }
-        
+    // Execute query
+    $result = mysqli_query($conn, $ajax_query);
+    
+    if (!$result) {
+        error_log("Search query error: " . mysqli_error($conn));
         echo json_encode([
-            'results' => $loans, 
-            'count' => count($loans), 
-            'search_term' => $search_term,
-            'open_loans_count' => $open_loans_count
-        ]);
-    } else {
-        echo json_encode([
-            'error' => 'Database error: ' . mysqli_error($conn), 
+            'error' => 'Database error occurred',
             'results' => [],
             'open_loans_count' => $open_loans_count
         ]);
+        exit();
     }
+    
+    $loans = [];
+    while ($row = mysqli_fetch_assoc($result)) {
+        // Determine match type
+        $match_type = 'partial';
+        if (stripos($row['receipt_number'], $search_term) === 0) {
+            $match_type = 'receipt_start';
+        } elseif (stripos($row['customer_name'], $search_term) === 0) {
+            $match_type = 'name_start';
+        } elseif ($row['receipt_number'] == $search_term) {
+            $match_type = 'exact';
+        }
+        
+        $loans[] = [
+            'id' => $row['id'],
+            'receipt_number' => htmlspecialchars($row['receipt_number']),
+            'customer_name' => htmlspecialchars($row['customer_name']),
+            'mobile' => htmlspecialchars($row['mobile_number']),
+            'loan_amount' => round(floatval($row['loan_amount']), 2),
+            'remaining_principal' => round(floatval($row['remaining_principal']), 2),
+            'pending_interest' => round(floatval($row['pending_interest']), 2),
+            'interest_rate' => $row['interest_amount'],
+            'overdue_amount' => round(floatval($row['total_overdue_amount']), 2),
+            'match_type' => $match_type
+        ];
+    }
+    
+    error_log("Found " . count($loans) . " results for: " . $search_term);
+    
+    echo json_encode([
+        'results' => $loans, 
+        'count' => count($loans), 
+        'search_term' => $search_term,
+        'open_loans_count' => $open_loans_count,
+        'success' => true
+    ]);
     exit();
 }
 
@@ -141,11 +181,8 @@ $search_term = isset($_GET['search']) ? mysqli_real_escape_string($conn, $_GET['
 
 // If receipt number is provided, search for loan
 if (!empty($search_term) && $loan_id == 0) {
-    $search_query = "SELECT id FROM loans WHERE receipt_number = ? AND status = 'open'";
-    $stmt = mysqli_prepare($conn, $search_query);
-    mysqli_stmt_bind_param($stmt, 's', $search_term);
-    mysqli_stmt_execute($stmt);
-    $search_result = mysqli_stmt_get_result($stmt);
+    $search_query = "SELECT id FROM loans WHERE receipt_number = '$search_term' AND status = 'open'";
+    $search_result = mysqli_query($conn, $search_query);
     
     if ($row = mysqli_fetch_assoc($search_result)) {
         $loan_id = $row['id'];
@@ -155,12 +192,9 @@ if (!empty($search_term) && $loan_id == 0) {
         $search_query = "SELECT l.id FROM loans l 
                          JOIN customers c ON l.customer_id = c.id 
                          WHERE l.status = 'open' 
-                         AND (c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                         AND (c.customer_name LIKE '$search_like' OR c.mobile_number LIKE '$search_like')
                          LIMIT 1";
-        $stmt = mysqli_prepare($conn, $search_query);
-        mysqli_stmt_bind_param($stmt, 'ss', $search_like, $search_like);
-        mysqli_stmt_execute($stmt);
-        $search_result = mysqli_stmt_get_result($stmt);
+        $search_result = mysqli_query($conn, $search_query);
         
         if ($row = mysqli_fetch_assoc($search_result)) {
             $loan_id = $row['id'];
@@ -183,22 +217,16 @@ if ($loan_id > 0) {
                    FROM loans l 
                    JOIN customers c ON l.customer_id = c.id 
                    JOIN users u ON l.employee_id = u.id 
-                   WHERE l.id = ? AND l.status = 'open'";
+                   WHERE l.id = $loan_id AND l.status = 'open'";
 
-    $stmt = mysqli_prepare($conn, $loan_query);
-    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-    mysqli_stmt_execute($stmt);
-    $loan_result = mysqli_stmt_get_result($stmt);
+    $loan_result = mysqli_query($conn, $loan_query);
 
     if (mysqli_num_rows($loan_result) > 0) {
         $loan = mysqli_fetch_assoc($loan_result);
         
         // Get loan items (jewelry)
-        $items_query = "SELECT * FROM loan_items WHERE loan_id = ?";
-        $stmt = mysqli_prepare($conn, $items_query);
-        mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-        mysqli_stmt_execute($stmt);
-        $items_result = mysqli_stmt_get_result($stmt);
+        $items_query = "SELECT * FROM loan_items WHERE loan_id = $loan_id";
+        $items_result = mysqli_query($conn, $items_query);
         $items = [];
         $total_net_weight = 0;
         while ($item = mysqli_fetch_assoc($items_result)) {
@@ -210,12 +238,9 @@ if ($loan_id > 0) {
         $payments_query = "SELECT p.*, u.name as employee_name
                           FROM payments p 
                           JOIN users u ON p.employee_id = u.id 
-                          WHERE p.loan_id = ? 
+                          WHERE p.loan_id = $loan_id 
                           ORDER BY p.payment_date DESC";
-        $stmt = mysqli_prepare($conn, $payments_query);
-        mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-        mysqli_stmt_execute($stmt);
-        $payments_result = mysqli_stmt_get_result($stmt);
+        $payments_result = mysqli_query($conn, $payments_query);
         $payments = [];
         while ($payment = mysqli_fetch_assoc($payments_result)) {
             $payments[] = $payment;
@@ -244,11 +269,9 @@ if ($loan_id > 0) {
         $total_paid_query = "SELECT SUM(principal_amount) as total_principal, 
                                     SUM(interest_amount) as total_interest,
                                     COUNT(*) as payment_count
-                             FROM payments WHERE loan_id = ?";
-        $stmt = mysqli_prepare($conn, $total_paid_query);
-        mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-        mysqli_stmt_execute($stmt);
-        $paid_total = mysqli_fetch_assoc(mysqli_stmt_get_result($stmt));
+                             FROM payments WHERE loan_id = $loan_id";
+        $paid_total_result = mysqli_query($conn, $total_paid_query);
+        $paid_total = mysqli_fetch_assoc($paid_total_result);
         
         $paid_principal = floatval($paid_total['total_principal'] ?? 0);
         $paid_interest = floatval($paid_total['total_interest'] ?? 0);
@@ -273,11 +296,7 @@ if ($loan_id > 0) {
         if ($payable_interest < 0) $payable_interest = 0;
         
         // Calculate 1 month interest
-        if ($interest_type == 'daily') {
-            $one_month_interest = ($principal * $interest_rate) / 100;
-        } else {
-            $one_month_interest = ($principal * $interest_rate) / 100;
-        }
+        $one_month_interest = ($principal * $interest_rate) / 100;
         
         // Total interest due
         $total_interest_due = $payable_interest;
@@ -323,22 +342,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $receipt_count = mysqli_fetch_assoc($receipt_result)['count'] + 1;
                 $payment_receipt = 'ADV' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
                 
+                $total_amount = $advance_principal + $advance_interest;
+                
                 $insert_payment = "INSERT INTO payments (
                     loan_id, receipt_number, payment_date, principal_amount, 
                     interest_amount, total_amount, payment_mode, employee_id, remarks
-                ) VALUES (?, ?, CURDATE(), ?, ?, ?, ?, ?, ?)";
+                ) VALUES ($loan_id, '$payment_receipt', CURDATE(), $advance_principal, $advance_interest, $total_amount, '$payment_mode', $employee_id, '$remarks')";
                 
-                $stmt = mysqli_prepare($conn, $insert_payment);
-                $total_amount = $advance_principal + $advance_interest;
-                
-                mysqli_stmt_bind_param($stmt, 'isdddiss', 
-                    $loan_id, $payment_receipt, 
-                    $advance_principal, $advance_interest, $total_amount,
-                    $payment_mode, $employee_id, $remarks
-                );
-                
-                if (!mysqli_stmt_execute($stmt)) {
-                    throw new Exception("Error adding advance payment: " . mysqli_stmt_error($stmt));
+                if (!mysqli_query($conn, $insert_payment)) {
+                    throw new Exception("Error adding advance payment: " . mysqli_error($conn));
                 }
                 
                 mysqli_commit($conn);
@@ -428,17 +440,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $insert_payment = "INSERT INTO payments (
                         loan_id, receipt_number, payment_date, principal_amount, 
                         interest_amount, total_amount, payment_mode, employee_id, remarks
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    ) VALUES ($loan_id, '$payment_receipt', '$close_date', $final_principal, $final_interest, $total_amount, '$payment_mode', $employee_id, '$remarks')";
                     
-                    $stmt = mysqli_prepare($conn, $insert_payment);
-                    mysqli_stmt_bind_param($stmt, 'issdddiss', 
-                        $loan_id, $payment_receipt, $close_date,
-                        $final_principal, $final_interest, $total_amount,
-                        $payment_mode, $employee_id, $remarks
-                    );
-                    
-                    if (!mysqli_stmt_execute($stmt)) {
-                        throw new Exception("Error adding final payment: " . mysqli_stmt_error($stmt));
+                    if (!mysqli_query($conn, $insert_payment)) {
+                        throw new Exception("Error adding final payment: " . mysqli_error($conn));
                     }
                 }
                 
@@ -448,18 +453,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     return_date, collection_type, receiving_person_name, receiving_person_relation,
                     receiving_person_mobile, receiving_person_id_proof, collection_person_photo,
                     signature_verified, id_proof_verified, remarks, created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                ) VALUES ($loan_id, '{$loan['receipt_number']}', {$customer['id']}, '{$customer['name']}',
+                    '$close_date', '$collection_type', '$receiving_person_name', '$receiving_person_relation',
+                    '$receiving_person_mobile', '$receiving_person_id_proof', '$saved_photo_path',
+                    $receiving_person_signature, $id_proof_verified, '$remarks', $employee_id)";
                 
-                $stmt = mysqli_prepare($conn, $insert_return);
-                mysqli_stmt_bind_param($stmt, 'isississsssissi', 
-                    $loan_id, $loan['receipt_number'], $customer['id'], $customer['name'],
-                    $close_date, $collection_type, $receiving_person_name, $receiving_person_relation,
-                    $receiving_person_mobile, $receiving_person_id_proof, $saved_photo_path,
-                    $receiving_person_signature, $id_proof_verified, $remarks, $employee_id
-                );
-                
-                if (!mysqli_stmt_execute($stmt)) {
-                    throw new Exception("Error recording jewelry return: " . mysqli_stmt_error($stmt));
+                if (!mysqli_query($conn, $insert_return)) {
+                    throw new Exception("Error recording jewelry return: " . mysqli_error($conn));
                 }
                 
                 $return_id = mysqli_insert_id($conn);
@@ -469,48 +469,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $insert_item_return = "INSERT INTO jewelry_return_items (
                         return_id, loan_id, item_id, jewel_name, karat, 
                         net_weight, quantity, defect_details, stone_details
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    ) VALUES ($return_id, $loan_id, {$item['id']}, '{$item['jewel_name']}', '{$item['karat']}',
+                        {$item['net_weight']}, {$item['quantity']}, '{$item['defect_details']}', '{$item['stone_details']}')";
                     
-                    $stmt = mysqli_prepare($conn, $insert_item_return);
-                    mysqli_stmt_bind_param($stmt, 'iiissdiss', 
-                        $return_id, $loan_id, $item['id'], $item['jewel_name'], $item['karat'],
-                        $item['net_weight'], $item['quantity'], $item['defect_details'], $item['stone_details']
-                    );
-                    
-                    if (!mysqli_stmt_execute($stmt)) {
-                        throw new Exception("Error recording jewelry item return: " . mysqli_stmt_error($stmt));
+                    if (!mysqli_query($conn, $insert_item_return)) {
+                        throw new Exception("Error recording jewelry item return: " . mysqli_error($conn));
                     }
                 }
                 
                 // Update loan as closed
                 $update_loan = "UPDATE loans SET 
                     status = 'closed', 
-                    close_date = ?,
-                    discount = ?,
-                    round_off = ?,
-                    d_namuna = ?,
-                    others = ?,
+                    close_date = '$close_date',
+                    discount = $discount,
+                    round_off = $round_off,
+                    d_namuna = $d_namuna,
+                    others = $others,
                     updated_at = NOW()
-                    WHERE id = ?";
+                    WHERE id = $loan_id";
                 
-                $stmt = mysqli_prepare($conn, $update_loan);
-                mysqli_stmt_bind_param($stmt, 'sddiii', 
-                    $close_date, $discount, $round_off, $d_namuna, $others, $loan_id
-                );
-                
-                if (!mysqli_stmt_execute($stmt)) {
-                    throw new Exception("Error closing loan: " . mysqli_stmt_error($stmt));
+                if (!mysqli_query($conn, $update_loan)) {
+                    throw new Exception("Error closing loan: " . mysqli_error($conn));
                 }
                 
                 // Log activity
-                $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
-                              VALUES (?, 'close', ?, 'loans', ?)";
-                $log_stmt = mysqli_prepare($conn, $log_query);
                 $log_description = "Loan closed with final payment of ₹" . number_format($total_amount, 2) . ". Jewelry collected by: " . 
                                    ($collection_type == 'customer' ? "Customer: " . $customer['name'] : 
                                     "Other Person: " . $receiving_person_name . " (Relation: " . $receiving_person_relation . ")");
-                mysqli_stmt_bind_param($log_stmt, 'isi', $_SESSION['user_id'], $log_description, $loan_id);
-                mysqli_stmt_execute($log_stmt);
+                
+                $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
+                              VALUES ({$_SESSION['user_id']}, 'close', '$log_description', 'loans', $loan_id)";
+                mysqli_query($conn, $log_query);
                 
                 mysqli_commit($conn);
                 
@@ -1511,7 +1500,7 @@ $total_data = mysqli_fetch_assoc($total_result);
                                         <td><?php echo $item['karat']; ?>K</td>
                                         <td><?php echo $item['net_weight']; ?> g</td>
                                         <td><?php echo $item['quantity']; ?></td>
-                                    </tr>
+                                      </tr>
                                     <?php endforeach; ?>
                                 </tbody>
                                 <tfoot>
@@ -1537,7 +1526,7 @@ $total_data = mysqli_fetch_assoc($total_result);
                             
                             <table class="items-table">
                                 <thead>
-                                     <tr>
+                                    <tr>
                                         <th>Date</th>
                                         <th>Receipt No</th>
                                         <th>Principal (₹)</th>
@@ -1904,7 +1893,7 @@ $total_data = mysqli_fetch_assoc($total_result);
             document.getElementById('photoStatus').innerHTML = '';
         }
 
-        // Live Search Functionality
+        // Live Search Functionality - Enhanced with better error handling
         let searchTimeout;
         const searchInput = document.getElementById('liveSearch');
         const searchResults = document.getElementById('searchResults');
@@ -1912,105 +1901,143 @@ $total_data = mysqli_fetch_assoc($total_result);
         const resultCount = document.getElementById('resultCount');
         const clearBtn = document.getElementById('clearSearch');
 
-        if (searchInput && searchInput.value.length > 0) {
-            clearBtn.style.display = 'block';
+        // Debug function
+        function debugLog(message, data) {
+            console.log('[Search Debug] ' + message);
+            if (data) console.log(data);
         }
 
         if (searchInput) {
+            // Check if there's initial value
+            if (searchInput.value.length > 0) {
+                if (clearBtn) clearBtn.style.display = 'block';
+                // Trigger search for initial value
+                const event = new Event('input');
+                searchInput.dispatchEvent(event);
+            }
+
             searchInput.addEventListener('input', function() {
                 const term = this.value.trim();
+                debugLog('Input changed: "' + term + '"');
                 
                 if (term.length > 0) {
-                    clearBtn.style.display = 'block';
+                    if (clearBtn) clearBtn.style.display = 'block';
                 } else {
-                    clearBtn.style.display = 'none';
-                    searchResults.classList.remove('show');
-                    searchStats.textContent = 'Type at least 2 characters to search';
-                    resultCount.textContent = '';
+                    if (clearBtn) clearBtn.style.display = 'none';
+                    if (searchResults) searchResults.classList.remove('show');
+                    if (searchStats) searchStats.textContent = 'Type at least 2 characters to search';
+                    if (resultCount) resultCount.textContent = '';
                     return;
                 }
 
                 clearTimeout(searchTimeout);
 
                 if (term.length < 2) {
-                    searchResults.classList.remove('show');
-                    searchStats.textContent = 'Type at least 2 characters to search';
-                    resultCount.textContent = '';
+                    if (searchResults) searchResults.classList.remove('show');
+                    if (searchStats) searchStats.textContent = 'Type at least 2 characters to search';
+                    if (resultCount) resultCount.textContent = '';
                     return;
                 }
 
-                searchResults.innerHTML = '<div class="loading-indicator"><i class="bi bi-arrow-repeat spin"></i> Searching...</div>';
-                searchResults.classList.add('show');
-                searchStats.textContent = `Searching for "${term}"...`;
+                if (searchResults) {
+                    searchResults.innerHTML = '<div class="loading-indicator"><i class="bi bi-arrow-repeat spin"></i> Searching...</div>';
+                    searchResults.classList.add('show');
+                }
+                if (searchStats) searchStats.textContent = `Searching for "${term}"...`;
 
                 searchTimeout = setTimeout(() => {
-                    fetch(`close-loan.php?ajax_search=1&term=${encodeURIComponent(term)}`)
-                        .then(response => response.json())
-                        .then(data => {
-                            if (data.error) {
+                    const url = `close-loan.php?ajax_search=1&term=${encodeURIComponent(term)}&t=${Date.now()}`;
+                    debugLog('Fetching URL: ' + url);
+                    
+                    fetch(url, {
+                        method: 'GET',
+                        headers: {
+                            'Accept': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        cache: 'no-cache'
+                    })
+                    .then(response => {
+                        debugLog('Response status: ' + response.status);
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        return response.json();
+                    })
+                    .then(data => {
+                        debugLog('Response received:', data);
+                        
+                        if (data.error) {
+                            debugLog('Server error: ' + data.error);
+                            if (searchResults) {
                                 searchResults.innerHTML = `<div class="no-results"><i class="bi bi-exclamation-circle"></i><br>${data.error}</div>`;
-                                searchStats.textContent = 'Error searching';
-                                resultCount.textContent = '';
-                                return;
                             }
-                            
-                            if (data.open_loans_count === 0) {
+                            if (searchStats) searchStats.textContent = 'Error searching';
+                            return;
+                        }
+                        
+                        if (data.open_loans_count === 0) {
+                            if (searchResults) {
                                 searchResults.innerHTML = '<div class="no-results"><i class="bi bi-info-circle"></i><br>No open loans found in the system!<br>Please create a loan first.</div>';
-                                searchStats.textContent = 'No open loans available';
-                                resultCount.textContent = '';
-                                return;
                             }
+                            if (searchStats) searchStats.textContent = 'No open loans available';
+                            return;
+                        }
 
-                            const results = data.results || [];
-                            
-                            if (results.length === 0) {
-                                searchResults.innerHTML = `<div class="no-results"><i class="bi bi-search"></i><br>No open loans found matching "${term}"<br>Try a different search term</div>`;
-                                searchStats.textContent = `No results for "${term}"`;
-                                resultCount.textContent = '';
-                            } else {
-                                let html = '';
-                                results.forEach(loan => {
-                                    const matchClass = loan.match_type === 'exact' ? 'exact' : '';
-                                    const matchText = loan.match_type === 'exact' ? 'Exact Match' : 
-                                                    loan.match_type === 'receipt_start' ? 'Receipt Match' :
-                                                    loan.match_type === 'name_start' ? 'Name Match' : 'Partial Match';
-                                    
-                                    html += `
-                                        <div class="search-result-item" onclick="selectLoan(${loan.id})">
-                                            <div class="match-badge ${matchClass}">${matchText}</div>
-                                            <div class="result-receipt">${escapeHtml(loan.receipt_number)}</div>
-                                            <div class="result-customer">${escapeHtml(loan.customer_name)}</div>
-                                            <div class="result-details">
-                                                <span class="result-mobile">📞 ${escapeHtml(loan.mobile)}</span>
-                                                <span class="result-balance">💰 Principal: ₹${Number(loan.remaining_principal).toLocaleString()}</span>
-                                                <span class="result-due">📈 Interest: ₹${Number(loan.pending_interest).toLocaleString()}</span>
-                                                ${loan.overdue_amount > 0 ? `<span class="result-overdue">⚠️ Overdue: ₹${loan.overdue_amount.toLocaleString()}</span>` : ''}
-                                            </div>
-                                        </div>
-                                    `;
-                                });
-                                searchResults.innerHTML = html;
-                                searchStats.textContent = `Found ${results.length} result${results.length > 1 ? 's' : ''} for "${term}"`;
-                                resultCount.textContent = `${results.length} results`;
+                        const results = data.results || [];
+                        debugLog(`Found ${results.length} results out of ${data.open_loans_count} open loans`);
+                        
+                        if (results.length === 0) {
+                            if (searchResults) {
+                                searchResults.innerHTML = `<div class="no-results"><i class="bi bi-search"></i><br>No open loans found matching "${escapeHtml(term)}"<br>Try a different search term</div>`;
                             }
-                        })
-                        .catch(error => {
-                            console.error('Search error:', error);
-                            searchResults.innerHTML = '<div class="no-results"><i class="bi bi-exclamation-triangle"></i><br>Error searching. Please try again.</div>';
-                            searchStats.textContent = 'Error occurred';
-                            resultCount.textContent = '';
-                        });
-                }, 300);
+                            if (searchStats) searchStats.textContent = `No results for "${term}"`;
+                            if (resultCount) resultCount.textContent = '';
+                        } else {
+                            let html = '';
+                            results.forEach(loan => {
+                                const matchClass = loan.match_type === 'exact' ? 'exact' : '';
+                                const matchText = loan.match_type === 'exact' ? 'Exact Match' : 
+                                                loan.match_type === 'receipt_start' ? 'Receipt Match' :
+                                                loan.match_type === 'name_start' ? 'Name Match' : 'Partial Match';
+                                
+                                html += `
+                                    <div class="search-result-item" onclick="selectLoan(${loan.id})">
+                                        <div class="match-badge ${matchClass}">${matchText}</div>
+                                        <div class="result-receipt">${escapeHtml(loan.receipt_number)}</div>
+                                        <div class="result-customer">${escapeHtml(loan.customer_name)}</div>
+                                        <div class="result-details">
+                                            <span class="result-mobile">📞 ${escapeHtml(loan.mobile)}</span>
+                                            <span class="result-balance">💰 Principal: ₹${Number(loan.remaining_principal).toLocaleString()}</span>
+                                            <span class="result-due">📈 Interest: ₹${Number(loan.pending_interest).toLocaleString()}</span>
+                                            ${loan.overdue_amount > 0 ? `<span class="result-overdue">⚠️ Overdue: ₹${loan.overdue_amount.toLocaleString()}</span>` : ''}
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                            if (searchResults) searchResults.innerHTML = html;
+                            if (searchStats) searchStats.textContent = `Found ${results.length} result${results.length > 1 ? 's' : ''} for "${term}"`;
+                            if (resultCount) resultCount.textContent = `${results.length} results`;
+                        }
+                    })
+                    .catch(error => {
+                        debugLog('Fetch error: ' + error.message);
+                        if (searchResults) {
+                            searchResults.innerHTML = '<div class="no-results"><i class="bi bi-exclamation-triangle"></i><br>Error searching. Please check your connection and try again.<br><small>Please refresh the page and try again</small></div>';
+                        }
+                        if (searchStats) searchStats.textContent = 'Connection error - please refresh and try again';
+                    });
+                }, 500);
             });
         }
 
         function clearSearch() {
             if (searchInput) {
                 searchInput.value = '';
-                clearBtn.style.display = 'none';
-                searchResults.classList.remove('show');
-                searchStats.textContent = 'Type at least 2 characters to search';
-                resultCount.textContent = '';
+                if (clearBtn) clearBtn.style.display = 'none';
+                if (searchResults) searchResults.classList.remove('show');
+                if (searchStats) searchStats.textContent = 'Type at least 2 characters to search';
+                if (resultCount) resultCount.textContent = '';
             }
         }
 
@@ -2091,14 +2118,14 @@ $total_data = mysqli_fetch_assoc($total_result);
             const cameraButtonDiv = document.getElementById('cameraButtonDiv');
             
             if (type === 'customer') {
-                customerBtn.classList.add('active');
-                otherBtn.classList.remove('active');
-                otherFields.classList.remove('show');
+                if (customerBtn) customerBtn.classList.add('active');
+                if (otherBtn) otherBtn.classList.remove('active');
+                if (otherFields) otherFields.classList.remove('show');
                 if (cameraButtonDiv) cameraButtonDiv.style.display = 'none';
             } else {
-                customerBtn.classList.remove('active');
-                otherBtn.classList.add('active');
-                otherFields.classList.add('show');
+                if (customerBtn) customerBtn.classList.remove('active');
+                if (otherBtn) otherBtn.classList.add('active');
+                if (otherFields) otherFields.classList.add('show');
                 if (cameraButtonDiv) cameraButtonDiv.style.display = 'block';
             }
         }
