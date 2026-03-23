@@ -4,6 +4,7 @@ $currentPage = 'loan-collection';
 $pageTitle = 'Loan Collection';
 require_once 'includes/db.php';
 require_once 'auth_check.php';
+require_once 'includes/email_helper.php';
 
 // Enable error reporting for debugging (remove in production)
 error_reporting(E_ALL);
@@ -28,13 +29,14 @@ $total_interest_paid = 0;
 $remaining_principal = 0;
 $pending_interest = 0;
 $interest_overdue = false;
+$monthly_schedule = [];
 
-// First, check if the new columns exist
+// Check if the new columns exist
 $check_columns_query = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
 $check_columns_result = mysqli_query($conn, $check_columns_query);
 $has_new_columns = (mysqli_num_rows($check_columns_result) > 0);
 
-// Get all open loans for dropdown - with conditional column selection
+// Get all open loans for dropdown
 if ($has_new_columns) {
     $open_loans_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
                          COALESCE(l.remaining_principal, l.loan_amount) as remaining_principal,
@@ -42,7 +44,7 @@ if ($has_new_columns) {
                          l.receipt_date, l.interest_amount,
                          l.net_weight, l.product_value, l.last_overdue_calculated, l.total_overdue_amount,
                          l.last_interest_paid_date,
-                         c.id as customer_id, c.customer_name, c.mobile_number,
+                         c.id as customer_id, c.customer_name, c.mobile_number, c.email,
                          DATEDIFF(NOW(), l.receipt_date) as days_old,
                          (SELECT COUNT(*) FROM payments WHERE loan_id = l.id) as payment_count,
                          (SELECT MAX(payment_date) FROM payments WHERE loan_id = l.id) as last_payment_date
@@ -51,14 +53,13 @@ if ($has_new_columns) {
                          WHERE l.status = 'open'
                          ORDER BY l.receipt_date DESC";
 } else {
-    // Fallback query if new columns don't exist
     $open_loans_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
                          l.loan_amount as remaining_principal,
                          0 as pending_interest,
                          l.receipt_date, l.interest_amount,
                          l.net_weight, l.product_value, l.last_overdue_calculated, l.total_overdue_amount,
                          l.last_interest_paid_date,
-                         c.id as customer_id, c.customer_name, c.mobile_number,
+                         c.id as customer_id, c.customer_name, c.mobile_number, c.email,
                          DATEDIFF(NOW(), l.receipt_date) as days_old,
                          (SELECT COUNT(*) FROM payments WHERE loan_id = l.id) as payment_count,
                          (SELECT MAX(payment_date) FROM payments WHERE loan_id = l.id) as last_payment_date
@@ -81,9 +82,98 @@ $bank_accounts_query = "SELECT ba.*, bm.bank_full_name
                         ORDER BY bm.bank_full_name, ba.account_holder_no";
 $bank_accounts_result = mysqli_query($conn, $bank_accounts_query);
 
-// Function to calculate due dates and overdue amounts based on remaining principal
+// Function to generate monthly interest schedule
+function generateMonthlyInterestSchedule($loan_id, $conn) {
+    $schedule = [];
+    
+    $query = "SELECT l.*, 
+              (SELECT SUM(interest_amount) FROM payments WHERE loan_id = l.id) as total_interest_paid,
+              (SELECT SUM(principal_amount) FROM payments WHERE loan_id = l.id) as total_principal_paid
+              FROM loans l WHERE l.id = ?";
+    
+    $stmt = mysqli_prepare($conn, $query);
+    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
+    mysqli_stmt_execute($stmt);
+    $result = mysqli_stmt_get_result($stmt);
+    $loan = mysqli_fetch_assoc($result);
+    
+    if (!$loan) return $schedule;
+    
+    $today = new DateTime();
+    $loan_start = new DateTime($loan['receipt_date']);
+    
+    $total_principal_paid = $loan['total_principal_paid'] ?? 0;
+    $remaining_principal = $loan['loan_amount'] - $total_principal_paid;
+    $interest_rate = floatval($loan['interest_amount']);
+    $monthly_interest = ($remaining_principal * $interest_rate) / 100;
+    
+    $payments_query = "SELECT payment_date, interest_amount, receipt_number 
+                       FROM payments 
+                       WHERE loan_id = ? AND interest_amount > 0 
+                       ORDER BY payment_date ASC";
+    $stmt = mysqli_prepare($conn, $payments_query);
+    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
+    mysqli_stmt_execute($stmt);
+    $payments_result = mysqli_stmt_get_result($stmt);
+    
+    $paid_months = [];
+    while ($payment = mysqli_fetch_assoc($payments_result)) {
+        $payment_date = new DateTime($payment['payment_date']);
+        $paid_months[$payment_date->format('Y-m')] = [
+            'amount' => $payment['interest_amount'],
+            'receipt' => $payment['receipt_number'],
+            'date' => $payment_date
+        ];
+    }
+    
+    $current_month = clone $loan_start;
+    $current_month->modify('first day of this month');
+    
+    while ($current_month <= $today) {
+        $month_key = $current_month->format('Y-m');
+        $month_start = clone $current_month;
+        $month_end = clone $current_month;
+        $month_end->modify('last day of this month');
+        
+        $interest_for_month = ($remaining_principal * $interest_rate) / 100;
+        
+        $status = 'pending';
+        $payment_receipt = null;
+        $payment_date = null;
+        $paid_amount = 0;
+        
+        if (isset($paid_months[$month_key])) {
+            $status = 'paid';
+            $payment_receipt = $paid_months[$month_key]['receipt'];
+            $payment_date = $paid_months[$month_key]['date'];
+            $paid_amount = $paid_months[$month_key]['amount'];
+        } elseif ($current_month < $today) {
+            $status = 'overdue';
+        }
+        
+        $is_current_month = ($current_month->format('Y-m') == $today->format('Y-m'));
+        
+        $schedule[] = [
+            'month' => $month_key,
+            'month_display' => $current_month->format('F Y'),
+            'month_start' => $month_start->format('Y-m-d'),
+            'month_end' => $month_end->format('Y-m-d'),
+            'interest_amount' => round($interest_for_month, 2),
+            'status' => $status,
+            'payment_receipt' => $payment_receipt,
+            'payment_date' => $payment_date ? $payment_date->format('d-m-Y') : null,
+            'paid_amount' => $paid_amount,
+            'is_current_month' => $is_current_month
+        ];
+        
+        $current_month->modify('first day of next month');
+    }
+    
+    return $schedule;
+}
+
+// Function to calculate due dates and overdue amounts
 function calculateOverdueDetails($loan_id, $conn) {
-    // Get loan details with remaining principal
     $query = "SELECT l.*, 
               (SELECT SUM(interest_amount) FROM payments WHERE loan_id = l.id) as total_interest_paid,
               (SELECT SUM(principal_amount) FROM payments WHERE loan_id = l.id) as total_principal_paid,
@@ -106,7 +196,6 @@ function calculateOverdueDetails($loan_id, $conn) {
     $today = new DateTime();
     $loan_start = new DateTime($loan['receipt_date']);
     
-    // Calculate remaining principal from payments if column doesn't exist
     $check_column_query = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
     $check_column_result = mysqli_query($conn, $check_column_query);
     $has_remaining_column = (mysqli_num_rows($check_column_result) > 0);
@@ -114,37 +203,30 @@ function calculateOverdueDetails($loan_id, $conn) {
     if ($has_remaining_column && isset($loan['remaining_principal']) && $loan['remaining_principal'] > 0) {
         $remaining_principal = $loan['remaining_principal'];
     } else {
-        // Calculate remaining principal from payments
         $total_principal_paid = $loan['total_principal_paid'] ?? 0;
         $remaining_principal = $loan['loan_amount'] - $total_principal_paid;
     }
     
     $regular_rate = floatval($loan['interest_amount']);
-    
-    // Calculate monthly and daily interest on remaining principal
     $monthly_interest = ($remaining_principal * $regular_rate) / 100;
     $daily_interest = $monthly_interest / 30;
     
     $overdue_details = [];
     $total_overdue = 0;
     
-    // Determine last paid date or loan start
     if (!empty($loan['last_interest_payment'])) {
         $last_paid = new DateTime($loan['last_interest_payment']);
     } else {
         $last_paid = clone $loan_start;
     }
     
-    // Calculate all due dates from last paid to today
     $current_due = clone $last_paid;
-    $current_due->modify('+1 month'); // First due date after last payment
+    $current_due->modify('+1 month');
     
     $overdue_months = 0;
     while ($current_due <= $today) {
         $due_date = clone $current_due;
         $days_overdue = $today->diff($due_date)->days;
-        
-        // Calculate overdue amount for this period based on remaining principal
         $period_overdue = ($remaining_principal * $regular_rate) / 100;
         
         $overdue_details[] = [
@@ -158,16 +240,12 @@ function calculateOverdueDetails($loan_id, $conn) {
         
         $total_overdue += $period_overdue;
         $overdue_months++;
-        
-        // Move to next month
         $current_due->modify('+1 month');
     }
     
-    // Calculate next due date
     $next_due = clone $last_paid;
     $next_due->modify('+1 month');
     if ($next_due <= $today) {
-        // Find the next future due date
         while ($next_due <= $today) {
             $next_due->modify('+1 month');
         }
@@ -188,9 +266,8 @@ function calculateOverdueDetails($loan_id, $conn) {
     ];
 }
 
-// Function to recalculate loan balances - FIXED VERSION
+// Function to recalculate loan balances
 function recalculateLoanBalances($loan_id, $conn) {
-    // Get loan details
     $query = "SELECT * FROM loans WHERE id = ?";
     $stmt = mysqli_prepare($conn, $query);
     mysqli_stmt_bind_param($stmt, 'i', $loan_id);
@@ -200,7 +277,6 @@ function recalculateLoanBalances($loan_id, $conn) {
     
     if (!$loan) return false;
     
-    // Get all payments
     $payments_query = "SELECT * FROM payments WHERE loan_id = ? ORDER BY payment_date, id";
     $stmt = mysqli_prepare($conn, $payments_query);
     mysqli_stmt_bind_param($stmt, 'i', $loan_id);
@@ -220,11 +296,9 @@ function recalculateLoanBalances($loan_id, $conn) {
     $remaining_principal = $loan['loan_amount'] - $total_principal_paid;
     if ($remaining_principal < 0) $remaining_principal = 0;
     
-    // Calculate interest accrued up to today
     $today = new DateTime();
     $loan_start = new DateTime($loan['receipt_date']);
     
-    // Determine last calculation date - use last payment date if available
     $last_calc_date = $loan_start;
     if (!empty($loan['last_interest_paid_date'])) {
         $last_calc_date = new DateTime($loan['last_interest_paid_date']);
@@ -232,19 +306,14 @@ function recalculateLoanBalances($loan_id, $conn) {
         $last_calc_date = new DateTime($last_payment_date);
     }
     
-    // Calculate days since last calculation
     $interval = $last_calc_date->diff($today);
     $days_since_calc = ($interval->y * 365) + ($interval->m * 30) + $interval->d;
     if ($days_since_calc < 0) $days_since_calc = 0;
     
-    // Calculate monthly interest on remaining principal
     $monthly_interest = ($remaining_principal * $loan['interest_amount']) / 100;
     $daily_interest = $monthly_interest / 30;
-    
-    // New interest accrued
     $new_interest = $days_since_calc * $daily_interest;
     
-    // Check if new columns exist
     $check_columns_query = "SHOW COLUMNS FROM loans LIKE 'total_interest_accrued'";
     $check_columns_result = mysqli_query($conn, $check_columns_query);
     $has_new_columns = (mysqli_num_rows($check_columns_result) > 0);
@@ -254,7 +323,6 @@ function recalculateLoanBalances($loan_id, $conn) {
         $pending_interest = $total_interest_accrued - $total_interest_paid;
         if ($pending_interest < 0) $pending_interest = 0;
         
-        // Update loan
         $update_query = "UPDATE loans SET 
                          remaining_principal = ?,
                          total_interest_accrued = ?,
@@ -281,16 +349,13 @@ function recalculateLoanBalances($loan_id, $conn) {
     ];
 }
 
-// Handle AJAX search request for live search
+// Handle AJAX search request
 if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
     header('Content-Type: application/json');
     $search_term = mysqli_real_escape_string($conn, $_GET['term']);
-    
-    // Prepare search terms for different matching strategies
     $search_term_like = '%' . $search_term . '%';
     $search_term_start = $search_term . '%';
     
-    // Check if new columns exist
     $check_columns_query = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
     $check_columns_result = mysqli_query($conn, $check_columns_query);
     $has_new_columns = (mysqli_num_rows($check_columns_result) > 0);
@@ -301,26 +366,12 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
                        COALESCE(l.pending_interest, 0) as pending_interest,
                        l.interest_amount,
                        l.receipt_date, l.total_overdue_amount,
-                       c.customer_name, c.mobile_number
+                       c.customer_name, c.mobile_number, c.email
                        FROM loans l
                        JOIN customers c ON l.customer_id = c.id
                        WHERE l.status = 'open' 
-                       AND (
-                           l.receipt_number LIKE ? OR 
-                           c.customer_name LIKE ? OR 
-                           c.mobile_number LIKE ? OR
-                           c.customer_name LIKE ? OR
-                           l.receipt_number LIKE ?
-                       )
-                       ORDER BY 
-                           CASE 
-                               WHEN l.receipt_number = ? THEN 1
-                               WHEN c.customer_name LIKE ? THEN 2
-                               WHEN l.receipt_number LIKE ? THEN 3
-                               WHEN c.mobile_number LIKE ? THEN 4
-                               ELSE 5
-                           END,
-                           l.receipt_date DESC
+                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       ORDER BY l.receipt_date DESC
                        LIMIT 50";
     } else {
         $ajax_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
@@ -328,42 +379,23 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
                        0 as pending_interest,
                        l.interest_amount,
                        l.receipt_date, l.total_overdue_amount,
-                       c.customer_name, c.mobile_number
+                       c.customer_name, c.mobile_number, c.email
                        FROM loans l
                        JOIN customers c ON l.customer_id = c.id
                        WHERE l.status = 'open' 
-                       AND (
-                           l.receipt_number LIKE ? OR 
-                           c.customer_name LIKE ? OR 
-                           c.mobile_number LIKE ? OR
-                           c.customer_name LIKE ? OR
-                           l.receipt_number LIKE ?
-                       )
-                       ORDER BY 
-                           CASE 
-                               WHEN l.receipt_number = ? THEN 1
-                               WHEN c.customer_name LIKE ? THEN 2
-                               WHEN l.receipt_number LIKE ? THEN 3
-                               WHEN c.mobile_number LIKE ? THEN 4
-                               ELSE 5
-                           END,
-                           l.receipt_date DESC
+                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       ORDER BY l.receipt_date DESC
                        LIMIT 50";
     }
     
     $stmt = mysqli_prepare($conn, $ajax_query);
     if ($stmt) {
-        mysqli_stmt_bind_param($stmt, 'sssssssss', 
-            $search_term_like, $search_term_like, $search_term_like,
-            $search_term_start, $search_term_start,
-            $search_term, $search_term_start, $search_term_start, $search_term_like
-        );
+        mysqli_stmt_bind_param($stmt, 'sss', $search_term_like, $search_term_like, $search_term_like);
         mysqli_stmt_execute($stmt);
         $result = mysqli_stmt_get_result($stmt);
         
         $loans = [];
         while ($row = mysqli_fetch_assoc($result)) {
-            // Determine match type for highlighting
             $match_type = 'partial';
             if (stripos($row['receipt_number'], $search_term) === 0) {
                 $match_type = 'receipt_start';
@@ -387,11 +419,7 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
             ];
         }
         
-        echo json_encode([
-            'results' => $loans,
-            'count' => count($loans),
-            'search_term' => $search_term
-        ]);
+        echo json_encode(['results' => $loans, 'count' => count($loans), 'search_term' => $search_term]);
     } else {
         echo json_encode(['error' => 'Database error', 'results' => []]);
     }
@@ -401,7 +429,6 @@ if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
 // Handle receipt search
 if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['select_receipt']) || isset($_GET['search'])) {
     
-    // Check which method was used
     if (isset($_POST['select_receipt']) && !empty($_POST['select_receipt'])) {
         $receipt_number = mysqli_real_escape_string($conn, $_POST['select_receipt']);
     } elseif (isset($_POST['receipt_number']) && !empty($_POST['receipt_number'])) {
@@ -415,10 +442,9 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
     }
     
     if (!empty($receipt_number)) {
-        // First try exact match by receipt number
         $loan_query = "SELECT l.*, 
                        c.id as customer_id, c.customer_name, c.guardian_type, c.guardian_name, 
-                       c.mobile_number, c.whatsapp_number, c.alternate_mobile,
+                       c.mobile_number, c.whatsapp_number, c.alternate_mobile, c.email,
                        c.door_no, c.house_name, c.street_name, c.street_name1, c.landmark,
                        c.location, c.district, c.pincode, c.post, c.taluk,
                        c.aadhaar_number, c.customer_photo,
@@ -437,11 +463,10 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
             if (mysqli_num_rows($loan_result) > 0) {
                 $loan = mysqli_fetch_assoc($loan_result);
             } else {
-                // If not found by receipt number, try by customer name or mobile
                 $search_term = '%' . $receipt_number . '%';
                 $loan_query = "SELECT l.*, 
                                c.id as customer_id, c.customer_name, c.guardian_type, c.guardian_name, 
-                               c.mobile_number, c.whatsapp_number, c.alternate_mobile,
+                               c.mobile_number, c.whatsapp_number, c.alternate_mobile, c.email,
                                c.door_no, c.house_name, c.street_name, c.street_name1, c.landmark,
                                c.location, c.district, c.pincode, c.post, c.taluk,
                                c.aadhaar_number, c.customer_photo,
@@ -467,7 +492,6 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
             }
             
             if (isset($loan) && $loan) {
-                // Recalculate loan balances
                 $balances = recalculateLoanBalances($loan['id'], $conn);
                 
                 $remaining_principal = $balances['remaining_principal'];
@@ -475,10 +499,9 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                 $total_principal_paid = $balances['total_principal_paid'];
                 $total_interest_paid = $balances['total_interest_paid'];
                 
-                // Calculate overdue details based on remaining principal
                 $overdue_details = calculateOverdueDetails($loan['id'], $conn);
+                $monthly_schedule = generateMonthlyInterestSchedule($loan['id'], $conn);
                 
-                // Get loan items
                 $items_query = "SELECT * FROM loan_items WHERE loan_id = ?";
                 $stmt = mysqli_prepare($conn, $items_query);
                 if ($stmt) {
@@ -491,7 +514,6 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                     }
                 }
                 
-                // Get all payments with new columns
                 $payments_query = "SELECT p.*, u.name as employee_name 
                                   FROM payments p 
                                   JOIN users u ON p.employee_id = u.id 
@@ -508,7 +530,6 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                     }
                 }
                 
-                // Get customer details
                 $customer = [
                     'id' => $loan['customer_id'],
                     'name' => $loan['customer_name'],
@@ -517,16 +538,15 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                     'mobile' => $loan['mobile_number'],
                     'whatsapp' => $loan['whatsapp_number'],
                     'alternate' => $loan['alternate_mobile'],
+                    'email' => $loan['email'] ?? '',
                     'address' => trim($loan['door_no'] . ' ' . $loan['street_name'] . ', ' . $loan['location'] . ', ' . $loan['district'] . ' - ' . $loan['pincode']),
                     'photo' => $loan['customer_photo']
                 ];
                 
-                // ========== FIXED INTEREST CALCULATION ==========
-                // Calculate current interest due based on remaining principal
+                // Calculate current interest due
                 $loan_start = new DateTime($loan['receipt_date']);
                 $today = new DateTime();
                 
-                // First, get the actual last payment date from payments table
                 $last_payment_query = "SELECT MAX(payment_date) as last_payment_date FROM payments 
                                        WHERE loan_id = ? AND (interest_amount > 0 OR principal_amount > 0)";
                 $stmt = mysqli_prepare($conn, $last_payment_query);
@@ -540,13 +560,11 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                     $last_payment_date = new DateTime($last_payment_row['last_payment_date']);
                 }
                 
-                // Get last interest paid date from loan table
                 $last_interest_date = null;
                 if (!empty($loan['last_interest_paid_date'])) {
                     $last_interest_date = new DateTime($loan['last_interest_paid_date']);
                 }
                 
-                // Use the most recent date for calculation
                 $calculation_start_date = $loan_start;
                 if ($last_payment_date && $last_payment_date > $calculation_start_date) {
                     $calculation_start_date = $last_payment_date;
@@ -555,27 +573,18 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
                     $calculation_start_date = $last_interest_date;
                 }
                 
-                // Calculate days since last payment
                 $interval = $calculation_start_date->diff($today);
                 $days_since_last_payment = ($interval->y * 365) + ($interval->m * 30) + $interval->d;
                 
-                // Calculate daily interest on remaining principal
                 $monthly_interest = ($remaining_principal * $loan['interest_amount']) / 100;
                 $daily_interest = $monthly_interest / 30;
+                $current_interest_due = round($days_since_last_payment * $daily_interest, 2);
                 
-                // Calculate current interest due
-                $current_interest_due = $days_since_last_payment * $daily_interest;
-                
-                // Round to 2 decimal places
-                $current_interest_due = round($current_interest_due, 2);
-                
-                // If current_interest_due is 0 but pending_interest > 0, use pending_interest
                 if ($current_interest_due == 0 && $pending_interest > 0) {
                     $current_interest_due = $pending_interest;
                 }
                 
                 $interest_overdue = ($current_interest_due > 0.01);
-                // ========== END FIXED INTEREST CALCULATION ==========
             }
         } else {
             $error = "Database error: " . mysqli_error($conn);
@@ -583,7 +592,100 @@ if (isset($_GET['receipt']) || isset($_POST['receipt_number']) || isset($_POST['
     }
 }
 
-// Handle interest payment submission (with balance tracking)
+// Handle monthly interest payment submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'pay_monthly_interest') {
+    $loan_id = intval($_POST['loan_id']);
+    $payment_date = mysqli_real_escape_string($conn, $_POST['payment_date']);
+    $interest_amount = floatval($_POST['interest_amount']);
+    $month_key = mysqli_real_escape_string($conn, $_POST['month_key']);
+    $payment_mode = mysqli_real_escape_string($conn, $_POST['payment_mode']);
+    $bank_account_id = isset($_POST['bank_account_id']) ? intval($_POST['bank_account_id']) : 0;
+    $collection_employee_id = intval($_POST['collection_employee_id']);
+    $remarks = mysqli_real_escape_string($conn, $_POST['remarks'] ?? 'Monthly Interest Payment');
+    $receipt_number = mysqli_real_escape_string($conn, $_POST['receipt_number']);
+    
+    $errors = [];
+    if ($interest_amount <= 0) $errors[] = "Interest amount must be greater than 0";
+    if ($collection_employee_id <= 0) $errors[] = "Please select the collecting employee";
+    if ($payment_mode === 'bank' && $bank_account_id <= 0) $errors[] = "Please select a bank account for bank transfer";
+    
+    if (empty($errors)) {
+        mysqli_begin_transaction($conn);
+        
+        try {
+            $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
+            $receipt_result = mysqli_query($conn, $receipt_query);
+            $receipt_row = mysqli_fetch_assoc($receipt_result);
+            $receipt_count = $receipt_row['count'] + 1;
+            $payment_receipt = 'INT' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
+            
+            $total_amount = $interest_amount;
+            
+            $insert_payment = "INSERT INTO payments (
+                loan_id, receipt_number, payment_date, principal_amount, 
+                interest_amount, total_amount, payment_mode, employee_id, remarks
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)";
+            
+            $stmt = mysqli_prepare($conn, $insert_payment);
+            mysqli_stmt_bind_param($stmt, 'issddiss', 
+                $loan_id, $payment_receipt, $payment_date, 
+                $interest_amount, $total_amount,
+                $payment_mode, $collection_employee_id, $remarks
+            );
+            
+            if (!mysqli_stmt_execute($stmt)) {
+                throw new Exception("Error inserting payment: " . mysqli_stmt_error($stmt));
+            }
+            
+            $payment_id = mysqli_insert_id($conn);
+            
+            $update_loan = "UPDATE loans SET last_interest_paid_date = ? WHERE id = ?";
+            $update_stmt = mysqli_prepare($conn, $update_loan);
+            mysqli_stmt_bind_param($update_stmt, 'si', $payment_date, $loan_id);
+            mysqli_stmt_execute($update_stmt);
+            
+            // Get customer details for email
+            $customer_query = "SELECT c.email, c.customer_name FROM loans l JOIN customers c ON l.customer_id = c.id WHERE l.id = ?";
+            $cust_stmt = mysqli_prepare($conn, $customer_query);
+            mysqli_stmt_bind_param($cust_stmt, 'i', $loan_id);
+            mysqli_stmt_execute($cust_stmt);
+            $cust_result = mysqli_stmt_get_result($cust_stmt);
+            $cust_data = mysqli_fetch_assoc($cust_result);
+            
+            mysqli_commit($conn);
+            
+            // Send email notification
+            if (!empty($cust_data['email'])) {
+                $payment_details = [
+                    'receipt_number' => $payment_receipt,
+                    'payment_date' => $payment_date,
+                    'interest_amount' => $interest_amount,
+                    'total_amount' => $total_amount,
+                    'payment_method' => $payment_mode,
+                    'loan_receipt' => $receipt_number,
+                    'customer_name' => $cust_data['customer_name'],
+                    'customer_email' => $cust_data['email'],
+                    'month_key' => $month_key,
+                    'remaining_principal' => $remaining_principal,
+                    'pending_interest' => $pending_interest - $interest_amount
+                ];
+                
+                sendMonthlyInterestPaymentConfirmation($payment_details, $conn);
+            }
+            
+            header('Location: loan-collection.php?search=' . urlencode($receipt_number) . '&success=payment_received&email=sent');
+            exit();
+            
+        } catch (Exception $e) {
+            mysqli_rollback($conn);
+            $error = "Error collecting payment: " . $e->getMessage();
+        }
+    } else {
+        $error = implode("<br>", $errors);
+    }
+}
+
+// Handle interest payment submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'collect_interest') {
     $loan_id = intval($_POST['loan_id']);
     $payment_date = mysqli_real_escape_string($conn, $_POST['payment_date']);
@@ -596,185 +698,83 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $remarks = mysqli_real_escape_string($conn, $_POST['remarks'] ?? 'Interest Collection');
     $receipt_number = mysqli_real_escape_string($conn, $_POST['receipt_number']);
     
-    // Get current loan balances
-    $loan_query = "SELECT loan_amount FROM loans WHERE id = ?";
-    $stmt = mysqli_prepare($conn, $loan_query);
-    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-    mysqli_stmt_execute($stmt);
-    $loan_result = mysqli_stmt_get_result($stmt);
-    $loan_data = mysqli_fetch_assoc($loan_result);
-    
-    // Calculate remaining principal from payments
-    $payments_query = "SELECT SUM(principal_amount) as total_principal_paid, 
-                              SUM(interest_amount) as total_interest_paid
-                       FROM payments WHERE loan_id = ?";
-    $stmt = mysqli_prepare($conn, $payments_query);
-    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-    mysqli_stmt_execute($stmt);
-    $payments_result = mysqli_stmt_get_result($stmt);
-    $payments_total = mysqli_fetch_assoc($payments_result);
-    
-    $remaining_principal_before = $loan_data['loan_amount'] - ($payments_total['total_principal_paid'] ?? 0);
-    $pending_interest_before = $payments_total['total_interest_paid'] ?? 0;
-    
-    // Determine if payment includes overdue amounts
-    $includes_overdue = ($overdue_amount > 0 || $overdue_charge > 0) ? 1 : 0;
-    
-    // Validate
     $errors = [];
-    if ($interest_amount <= 0 && $overdue_amount <= 0 && $overdue_charge <= 0) {
-        $errors[] = "Amount must be greater than 0";
-    }
+    if ($interest_amount <= 0 && $overdue_amount <= 0 && $overdue_charge <= 0) $errors[] = "Amount must be greater than 0";
     if ($collection_employee_id <= 0) $errors[] = "Please select the collecting employee";
-    if ($payment_mode === 'bank' && $bank_account_id <= 0) {
-        $errors[] = "Please select a bank account for bank transfer";
-    }
+    if ($payment_mode === 'bank' && $bank_account_id <= 0) $errors[] = "Please select a bank account for bank transfer";
     
     if (empty($errors)) {
-        // Begin transaction
         mysqli_begin_transaction($conn);
         
         try {
-            // Generate payment receipt number based on type
             $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
             $receipt_result = mysqli_query($conn, $receipt_query);
             $receipt_row = mysqli_fetch_assoc($receipt_result);
             $receipt_count = $receipt_row['count'] + 1;
             
-            // Determine receipt prefix
             if ($overdue_charge > 0) {
-                $prefix = 'CHG'; // Overdue Charge
+                $prefix = 'CHG';
             } elseif ($overdue_amount > 0 && $interest_amount > 0) {
-                $prefix = 'INT'; // Interest + Overdue
+                $prefix = 'INT';
             } elseif ($overdue_amount > 0) {
-                $prefix = 'OVD'; // Overdue Only
+                $prefix = 'OVD';
             } else {
-                $prefix = 'INT'; // Interest Only
+                $prefix = 'INT';
             }
             
             $payment_receipt = $prefix . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
-            
             $total_amount = $interest_amount + $overdue_amount + $overdue_charge;
             
-            // Calculate remaining balances after payment
-            $remaining_interest_after = $pending_interest_before - $interest_amount;
-            if ($remaining_interest_after < 0) $remaining_interest_after = 0;
-            
-            // Insert interest payment
             $insert_payment = "INSERT INTO payments (
                 loan_id, receipt_number, payment_date, principal_amount, 
-                interest_amount, total_amount, payment_mode, employee_id, remarks,
-                includes_overdue, overdue_amount_paid, overdue_charge
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)";
+                interest_amount, total_amount, payment_mode, employee_id, remarks
+            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)";
             
             $stmt = mysqli_prepare($conn, $insert_payment);
-            mysqli_stmt_bind_param($stmt, 'issdddissdd', 
+            mysqli_stmt_bind_param($stmt, 'issddiss', 
                 $loan_id, $payment_receipt, $payment_date, 
                 $interest_amount, $total_amount,
-                $payment_mode, $collection_employee_id, $remarks,
-                $includes_overdue, $overdue_amount, $overdue_charge
+                $payment_mode, $collection_employee_id, $remarks
             );
             
             if (!mysqli_stmt_execute($stmt)) {
                 throw new Exception("Error inserting payment: " . mysqli_stmt_error($stmt));
             }
             
-            $payment_id = mysqli_insert_id($conn);
-            
-            // Update loan last interest paid date
             $update_loan = "UPDATE loans SET last_interest_paid_date = ? WHERE id = ?";
             $update_stmt = mysqli_prepare($conn, $update_loan);
             mysqli_stmt_bind_param($update_stmt, 'si', $payment_date, $loan_id);
             mysqli_stmt_execute($update_stmt);
             
-            // If payment mode is bank, update bank ledger
-            if ($payment_mode === 'bank' && $bank_account_id > 0) {
-                // Get bank details
-                $bank_query = "SELECT bank_id FROM bank_accounts WHERE id = ?";
-                $bank_stmt = mysqli_prepare($conn, $bank_query);
-                mysqli_stmt_bind_param($bank_stmt, 'i', $bank_account_id);
-                mysqli_stmt_execute($bank_stmt);
-                $bank_result = mysqli_stmt_get_result($bank_stmt);
-                $bank_data = mysqli_fetch_assoc($bank_result);
-                $bank_id = $bank_data['bank_id'];
-                
-                // Get current balance
-                $balance_query = "SELECT balance FROM bank_ledger 
-                                 WHERE bank_account_id = ? 
-                                 ORDER BY id DESC LIMIT 1";
-                $balance_stmt = mysqli_prepare($conn, $balance_query);
-                mysqli_stmt_bind_param($balance_stmt, 'i', $bank_account_id);
-                mysqli_stmt_execute($balance_stmt);
-                $balance_result = mysqli_stmt_get_result($balance_stmt);
-                
-                if (mysqli_num_rows($balance_result) > 0) {
-                    $balance_row = mysqli_fetch_assoc($balance_result);
-                    $last_balance = $balance_row['balance'];
-                } else {
-                    // Get opening balance
-                    $opening_query = "SELECT opening_balance FROM bank_accounts WHERE id = ?";
-                    $opening_stmt = mysqli_prepare($conn, $opening_query);
-                    mysqli_stmt_bind_param($opening_stmt, 'i', $bank_account_id);
-                    mysqli_stmt_execute($opening_stmt);
-                    $opening_result = mysqli_stmt_get_result($opening_stmt);
-                    $opening_data = mysqli_fetch_assoc($opening_result);
-                    $last_balance = $opening_data['opening_balance'];
-                }
-                
-                $new_balance = $last_balance + $total_amount;
-                
-                // Insert into bank ledger
-                $ledger_query = "INSERT INTO bank_ledger (
-                    entry_date, bank_id, bank_account_id, transaction_type, 
-                    amount, balance, reference_number, description, payment_id, loan_id, created_by
-                ) VALUES (?, ?, ?, 'credit', ?, ?, ?, ?, ?, ?, ?)";
-                
-                $description = "Interest collection - Receipt #: " . $payment_receipt;
-                $ledger_stmt = mysqli_prepare($conn, $ledger_query);
-                mysqli_stmt_bind_param($ledger_stmt, 'siidsssiii', 
-                    $payment_date, $bank_id, $bank_account_id,
-                    $total_amount, $new_balance, $payment_receipt, $description,
-                    $payment_id, $loan_id, $_SESSION['user_id']
-                );
-                
-                if (!mysqli_stmt_execute($ledger_stmt)) {
-                    throw new Exception("Error updating bank ledger: " . mysqli_stmt_error($ledger_stmt));
-                }
-            }
-            
-            // Get employee name for log
-            $emp_name_query = "SELECT name FROM users WHERE id = ?";
-            $emp_stmt = mysqli_prepare($conn, $emp_name_query);
-            mysqli_stmt_bind_param($emp_stmt, 'i', $collection_employee_id);
-            mysqli_stmt_execute($emp_stmt);
-            $emp_result = mysqli_stmt_get_result($emp_stmt);
-            $emp_data = mysqli_fetch_assoc($emp_result);
-            $emp_name = $emp_data['name'];
-            
-            // Log activity with detailed description
-            $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
-                          VALUES (?, 'interest_collection', ?, 'payments', ?)";
-            $log_stmt = mysqli_prepare($conn, $log_query);
-            
-            $log_description = "Payment of ₹" . number_format($total_amount, 2);
-            $details = [];
-            if ($interest_amount > 0) $details[] = "Interest: ₹" . number_format($interest_amount, 2);
-            if ($overdue_amount > 0) $details[] = "Overdue: ₹" . number_format($overdue_amount, 2);
-            if ($overdue_charge > 0) $details[] = "Charge: ₹" . number_format($overdue_charge, 2);
-            
-            $log_description .= " (" . implode(" + ", $details) . ") collected by " . $emp_name . " for Loan #" . $receipt_number;
-            
-            if ($payment_mode === 'bank') {
-                $log_description .= " via Bank Transfer";
-            }
-            
-            mysqli_stmt_bind_param($log_stmt, 'isi', $_SESSION['user_id'], $log_description, $loan_id);
-            mysqli_stmt_execute($log_stmt);
+            // Get customer details for email
+            $customer_query = "SELECT c.email, c.customer_name FROM loans l JOIN customers c ON l.customer_id = c.id WHERE l.id = ?";
+            $cust_stmt = mysqli_prepare($conn, $customer_query);
+            mysqli_stmt_bind_param($cust_stmt, 'i', $loan_id);
+            mysqli_stmt_execute($cust_stmt);
+            $cust_result = mysqli_stmt_get_result($cust_stmt);
+            $cust_data = mysqli_fetch_assoc($cust_result);
             
             mysqli_commit($conn);
             
-            // Redirect to bill receipt page
-            header('Location: bill-receipt.php?receipt=' . urlencode($payment_receipt) . '&success=payment_received');
+            // Send email notification
+            if (!empty($cust_data['email'])) {
+                $payment_details = [
+                    'receipt_number' => $payment_receipt,
+                    'payment_date' => $payment_date,
+                    'interest_amount' => $interest_amount,
+                    'overdue_amount' => $overdue_amount,
+                    'overdue_charge' => $overdue_charge,
+                    'total_amount' => $total_amount,
+                    'payment_method' => $payment_mode,
+                    'loan_receipt' => $receipt_number,
+                    'customer_name' => $cust_data['customer_name'],
+                    'customer_email' => $cust_data['email']
+                ];
+                
+                sendPaymentConfirmationEmail($payment_details, $conn);
+            }
+            
+            header('Location: loan-collection.php?search=' . urlencode($receipt_number) . '&success=payment_received&email=sent');
             exit();
             
         } catch (Exception $e) {
@@ -786,7 +786,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
-// Handle principal payment submission (with balance tracking) - FIXED VERSION
+// Handle principal payment submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'pay_principal') {
     $loan_id = intval($_POST['loan_id']);
     $payment_date = mysqli_real_escape_string($conn, $_POST['payment_date']);
@@ -798,65 +798,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $receipt_number = mysqli_real_escape_string($conn, $_POST['receipt_number']);
     $current_interest_due = floatval($_POST['current_interest_due']);
     
-    // Get current loan balances
-    $loan_query = "SELECT loan_amount FROM loans WHERE id = ?";
-    $stmt = mysqli_prepare($conn, $loan_query);
-    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-    mysqli_stmt_execute($stmt);
-    $loan_result = mysqli_stmt_get_result($stmt);
-    $loan_data = mysqli_fetch_assoc($loan_result);
-    
-    // Calculate remaining principal from payments
-    $payments_query = "SELECT SUM(principal_amount) as total_principal_paid 
-                       FROM payments WHERE loan_id = ?";
-    $stmt = mysqli_prepare($conn, $payments_query);
-    mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-    mysqli_stmt_execute($stmt);
-    $payments_result = mysqli_stmt_get_result($stmt);
-    $payments_total = mysqli_fetch_assoc($payments_result);
-    
-    $remaining_principal_before = $loan_data['loan_amount'] - ($payments_total['total_principal_paid'] ?? 0);
-    
-    // Validate
     $errors = [];
-    
-    // Check if interest is overdue - CANNOT pay principal if interest is due
-    if ($current_interest_due > 0.01) {
-        $errors[] = "Cannot pay principal while interest of ₹" . number_format($current_interest_due, 2) . " is due. Please pay interest first.";
-    }
-    
+    if ($current_interest_due > 0.01) $errors[] = "Cannot pay principal while interest of ₹" . number_format($current_interest_due, 2) . " is due. Please pay interest first.";
     if ($principal_amount <= 0) $errors[] = "Principal amount must be greater than 0";
     if ($collection_employee_id <= 0) $errors[] = "Please select the collecting employee";
-    if ($payment_mode === 'bank' && $bank_account_id <= 0) {
-        $errors[] = "Please select a bank account for bank transfer";
-    }
-    
-    // Check if principal amount exceeds remaining principal
-    if ($principal_amount > $remaining_principal_before) {
-        $errors[] = "Principal payment of ₹" . number_format($principal_amount, 2) . " exceeds remaining principal of ₹" . number_format($remaining_principal_before, 2);
-    }
+    if ($payment_mode === 'bank' && $bank_account_id <= 0) $errors[] = "Please select a bank account for bank transfer";
     
     if (empty($errors)) {
-        // Begin transaction
         mysqli_begin_transaction($conn);
         
         try {
-            // Generate payment receipt number
             $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
             $receipt_result = mysqli_query($conn, $receipt_query);
             $receipt_row = mysqli_fetch_assoc($receipt_result);
             $receipt_count = $receipt_row['count'] + 1;
             $payment_receipt = 'PRN' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
             
-            // Calculate remaining balances after payment
-            $remaining_principal_after = $remaining_principal_before - $principal_amount;
-            
-            // Insert principal payment
             $insert_payment = "INSERT INTO payments (
                 loan_id, receipt_number, payment_date, principal_amount, 
-                interest_amount, total_amount, payment_mode, employee_id, remarks,
-                includes_overdue, overdue_amount_paid, overdue_charge
-            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0, 0, 0)";
+                interest_amount, total_amount, payment_mode, employee_id, remarks
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)";
             
             $stmt = mysqli_prepare($conn, $insert_payment);
             mysqli_stmt_bind_param($stmt, 'issddiss', 
@@ -871,106 +832,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             
             $payment_id = mysqli_insert_id($conn);
             
-            // Update loan remaining principal if column exists
             $check_loan_column = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
             $check_loan_result = mysqli_query($conn, $check_loan_column);
             if (mysqli_num_rows($check_loan_result) > 0) {
+                $loan_data_query = "SELECT loan_amount FROM loans WHERE id = ?";
+                $loan_stmt = mysqli_prepare($conn, $loan_data_query);
+                mysqli_stmt_bind_param($loan_stmt, 'i', $loan_id);
+                mysqli_stmt_execute($loan_stmt);
+                $loan_result = mysqli_stmt_get_result($loan_stmt);
+                $loan_data = mysqli_fetch_assoc($loan_result);
+                
+                $payments_total_query = "SELECT SUM(principal_amount) as total_principal_paid FROM payments WHERE loan_id = ?";
+                $payments_stmt = mysqli_prepare($conn, $payments_total_query);
+                mysqli_stmt_bind_param($payments_stmt, 'i', $loan_id);
+                mysqli_stmt_execute($payments_stmt);
+                $payments_result = mysqli_stmt_get_result($payments_stmt);
+                $payments_total = mysqli_fetch_assoc($payments_result);
+                
+                $remaining_principal = $loan_data['loan_amount'] - ($payments_total['total_principal_paid'] ?? 0);
+                $remaining_principal_after = $remaining_principal - $principal_amount;
+                
                 $update_loan = "UPDATE loans SET remaining_principal = ? WHERE id = ?";
                 $update_stmt = mysqli_prepare($conn, $update_loan);
                 mysqli_stmt_bind_param($update_stmt, 'di', $remaining_principal_after, $loan_id);
                 mysqli_stmt_execute($update_stmt);
             }
             
-            // If payment mode is bank, update bank ledger
-            if ($payment_mode === 'bank' && $bank_account_id > 0) {
-                // Get bank details
-                $bank_query = "SELECT bank_id FROM bank_accounts WHERE id = ?";
-                $bank_stmt = mysqli_prepare($conn, $bank_query);
-                mysqli_stmt_bind_param($bank_stmt, 'i', $bank_account_id);
-                mysqli_stmt_execute($bank_stmt);
-                $bank_result = mysqli_stmt_get_result($bank_stmt);
-                $bank_data = mysqli_fetch_assoc($bank_result);
-                $bank_id = $bank_data['bank_id'];
-                
-                // Get current balance
-                $balance_query = "SELECT balance FROM bank_ledger 
-                                 WHERE bank_account_id = ? 
-                                 ORDER BY id DESC LIMIT 1";
-                $balance_stmt = mysqli_prepare($conn, $balance_query);
-                mysqli_stmt_bind_param($balance_stmt, 'i', $bank_account_id);
-                mysqli_stmt_execute($balance_stmt);
-                $balance_result = mysqli_stmt_get_result($balance_stmt);
-                
-                if (mysqli_num_rows($balance_result) > 0) {
-                    $balance_row = mysqli_fetch_assoc($balance_result);
-                    $last_balance = $balance_row['balance'];
-                } else {
-                    // Get opening balance
-                    $opening_query = "SELECT opening_balance FROM bank_accounts WHERE id = ?";
-                    $opening_stmt = mysqli_prepare($conn, $opening_query);
-                    mysqli_stmt_bind_param($opening_stmt, 'i', $bank_account_id);
-                    mysqli_stmt_execute($opening_stmt);
-                    $opening_result = mysqli_stmt_get_result($opening_stmt);
-                    $opening_data = mysqli_fetch_assoc($opening_result);
-                    $last_balance = $opening_data['opening_balance'];
-                }
-                
-                $new_balance = $last_balance + $principal_amount;
-                
-                // Insert into bank ledger
-                $ledger_query = "INSERT INTO bank_ledger (
-                    entry_date, bank_id, bank_account_id, transaction_type, 
-                    amount, balance, reference_number, description, payment_id, loan_id, created_by
-                ) VALUES (?, ?, ?, 'credit', ?, ?, ?, ?, ?, ?, ?)";
-                
-                $description = "Principal payment - Receipt #: " . $payment_receipt;
-                $ledger_stmt = mysqli_prepare($conn, $ledger_query);
-                mysqli_stmt_bind_param($ledger_stmt, 'siidsssiii', 
-                    $payment_date, $bank_id, $bank_account_id,
-                    $principal_amount, $new_balance, $payment_receipt, $description,
-                    $payment_id, $loan_id, $_SESSION['user_id']
-                );
-                
-                if (!mysqli_stmt_execute($ledger_stmt)) {
-                    throw new Exception("Error updating bank ledger: " . mysqli_stmt_error($ledger_stmt));
-                }
-            }
-            
-            // Check if loan is fully paid
+            $loan_fully_paid = false;
             if ($remaining_principal_after <= 0) {
-                // Close the loan
                 $close_query = "UPDATE loans SET status = 'closed', close_date = ? WHERE id = ?";
                 $close_stmt = mysqli_prepare($conn, $close_query);
                 mysqli_stmt_bind_param($close_stmt, 'si', $payment_date, $loan_id);
                 mysqli_stmt_execute($close_stmt);
+                $loan_fully_paid = true;
             }
             
-            // Get employee name for log
-            $emp_name_query = "SELECT name FROM users WHERE id = ?";
-            $emp_stmt = mysqli_prepare($conn, $emp_name_query);
-            mysqli_stmt_bind_param($emp_stmt, 'i', $collection_employee_id);
-            mysqli_stmt_execute($emp_stmt);
-            $emp_result = mysqli_stmt_get_result($emp_stmt);
-            $emp_data = mysqli_fetch_assoc($emp_result);
-            $emp_name = $emp_data['name'];
-            
-            // Log activity
-            $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
-                          VALUES (?, 'principal_payment', ?, 'payments', ?)";
-            $log_stmt = mysqli_prepare($conn, $log_query);
-            $log_description = "Principal of ₹" . number_format($principal_amount, 2) . " paid by " . $emp_name . " for Loan #" . $receipt_number;
-            
-            if ($payment_mode === 'bank') {
-                $log_description .= " via Bank Transfer";
-            }
-            
-            mysqli_stmt_bind_param($log_stmt, 'isi', $_SESSION['user_id'], $log_description, $loan_id);
-            mysqli_stmt_execute($log_stmt);
+            // Get customer details for email
+            $customer_query = "SELECT c.email, c.customer_name FROM loans l JOIN customers c ON l.customer_id = c.id WHERE l.id = ?";
+            $cust_stmt = mysqli_prepare($conn, $customer_query);
+            mysqli_stmt_bind_param($cust_stmt, 'i', $loan_id);
+            mysqli_stmt_execute($cust_stmt);
+            $cust_result = mysqli_stmt_get_result($cust_stmt);
+            $cust_data = mysqli_fetch_assoc($cust_result);
             
             mysqli_commit($conn);
             
-            // Redirect to bill receipt page
-            header('Location: bill-receipt.php?receipt=' . urlencode($payment_receipt) . '&success=payment_received');
+            // Send email notification
+            if (!empty($cust_data['email'])) {
+                $payment_details = [
+                    'receipt_number' => $payment_receipt,
+                    'payment_date' => $payment_date,
+                    'principal_amount' => $principal_amount,
+                    'total_amount' => $principal_amount,
+                    'payment_method' => $payment_mode,
+                    'remaining_principal' => $remaining_principal_after,
+                    'loan_receipt' => $receipt_number,
+                    'customer_name' => $cust_data['customer_name'],
+                    'customer_email' => $cust_data['email'],
+                    'loan_fully_paid' => $loan_fully_paid,
+                    'original_principal' => $loan_data['loan_amount']
+                ];
+                
+                sendPrincipalPaymentConfirmationEmail($payment_details, $conn);
+            }
+            
+            header('Location: loan-collection.php?search=' . urlencode($receipt_number) . '&success=payment_received&email=sent');
             exit();
             
         } catch (Exception $e) {
@@ -982,12 +908,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
-// Check for success messages from bill receipt page
 if (isset($_GET['success']) && $_GET['success'] == 'payment_received') {
     $message = "Payment processed successfully!";
 }
 
-// Get company settings for display
 $company_query = "SELECT * FROM branches WHERE id = 1 LIMIT 1";
 $company_result = mysqli_query($conn, $company_query);
 $company = mysqli_fetch_assoc($company_result);
@@ -1019,7 +943,7 @@ if (!$company) {
 
         body {
             font-family: 'Poppins', sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #f8fafc;
         }
 
         .app-wrapper {
@@ -1115,11 +1039,12 @@ if (!$company) {
 
         .btn-warning {
             background: #ecc94b;
-            color: white;
+            color: #744210;
         }
 
         .btn-warning:hover {
             background: #d69e2e;
+            color: white;
         }
 
         .btn-info {
@@ -1129,15 +1054,6 @@ if (!$company) {
 
         .btn-info:hover {
             background: #3182ce;
-        }
-
-        .btn-danger {
-            background: #f56565;
-            color: white;
-        }
-
-        .btn-danger:hover {
-            background: #c53030;
         }
 
         .btn-secondary {
@@ -1189,7 +1105,6 @@ if (!$company) {
             color: #667eea;
         }
 
-        /* Live Search Styles */
         .live-search-container {
             position: relative;
             margin-bottom: 20px;
@@ -1268,11 +1183,6 @@ if (!$company) {
             background: #ebf4ff;
         }
 
-        .search-result-item.selected {
-            background: #c3dafe;
-            border-left: 4px solid #667eea;
-        }
-
         .match-badge {
             position: absolute;
             top: 10px;
@@ -1322,60 +1232,9 @@ if (!$company) {
             font-weight: 600;
         }
 
-        .result-due {
-            color: #ecc94b;
-            font-weight: 600;
-        }
-
         .result-overdue {
             color: #f56565;
             font-weight: 600;
-        }
-
-        .result-badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 20px;
-            font-size: 11px;
-            font-weight: 600;
-            margin-right: 5px;
-        }
-
-        .badge-overdue {
-            background: #f56565;
-            color: white;
-        }
-
-        .badge-due {
-            background: #ecc94b;
-            color: #744210;
-        }
-
-        .loading-indicator {
-            text-align: center;
-            padding: 20px;
-            color: #718096;
-        }
-
-        .loading-indicator i {
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .no-results {
-            padding: 30px;
-            text-align: center;
-            color: #718096;
-        }
-
-        .no-results i {
-            font-size: 48px;
-            color: #cbd5e0;
-            margin-bottom: 10px;
         }
 
         .search-stats {
@@ -1385,6 +1244,16 @@ if (!$company) {
             display: flex;
             justify-content: space-between;
             align-items: center;
+        }
+
+        .quick-stats {
+            display: flex;
+            gap: 20px;
+            margin-top: 20px;
+            padding: 15px;
+            background: #f7fafc;
+            border-radius: 8px;
+            flex-wrap: wrap;
         }
 
         .info-card {
@@ -1420,6 +1289,288 @@ if (!$company) {
             font-weight: 600;
             display: inline-block;
             margin-bottom: 20px;
+        }
+
+        .overdue-badge {
+            background: #f56565;
+            color: white;
+            padding: 8px 20px;
+            border-radius: 50px;
+            font-size: 18px;
+            font-weight: 600;
+            display: inline-block;
+            margin-left: 10px;
+        }
+
+        .balance-summary {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin: 20px 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
+            border-radius: 12px;
+        }
+
+        .balance-box {
+            text-align: center;
+            padding: 15px;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }
+
+        .balance-box.principal {
+            border-top: 4px solid #4299e1;
+        }
+
+        .balance-box.interest {
+            border-top: 4px solid #ecc94b;
+        }
+
+        .balance-box.total {
+            border-top: 4px solid #48bb78;
+        }
+
+        .balance-label {
+            font-size: 14px;
+            color: #718096;
+            margin-bottom: 5px;
+        }
+
+        .balance-value {
+            font-size: 24px;
+            font-weight: 700;
+        }
+
+        .balance-value.principal {
+            color: #4299e1;
+        }
+
+        .balance-value.interest {
+            color: #ecc94b;
+        }
+
+        .balance-value.total {
+            color: #48bb78;
+        }
+
+        .balance-note {
+            font-size: 12px;
+            color: #a0aec0;
+            margin-top: 5px;
+        }
+
+        .progress-container {
+            margin: 15px 0;
+            background: #edf2f7;
+            border-radius: 10px;
+            height: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #4299e1, #48bb78);
+            border-radius: 10px;
+            transition: width 0.3s ease;
+        }
+
+        /* Monthly Schedule Table Styles */
+        .monthly-schedule {
+            margin: 20px 0;
+            overflow-x: auto;
+        }
+        
+        .schedule-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        .schedule-table th {
+            background: #f7fafc;
+            padding: 15px 12px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+            color: #4a5568;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        .schedule-table td {
+            padding: 12px;
+            border-bottom: 1px solid #e2e8f0;
+            font-size: 14px;
+        }
+        
+        .schedule-table tr:hover {
+            background: #f7fafc;
+        }
+        
+        .status-paid {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #c6f6d5;
+            color: #22543d;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .status-pending {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #feebc8;
+            color: #744210;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .status-overdue {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #fed7d7;
+            color: #c53030;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .btn-pay-monthly {
+            background: #48bb78;
+            color: white;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .btn-pay-monthly:hover {
+            background: #38a169;
+            transform: translateY(-1px);
+        }
+        
+        .receipt-link {
+            color: #4299e1;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        
+        .receipt-link:hover {
+            text-decoration: underline;
+        }
+        
+        .schedule-summary {
+            margin-top: 15px;
+            padding: 15px;
+            background: #ebf8ff;
+            border-radius: 10px;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .schedule-summary-item {
+            text-align: center;
+        }
+        
+        .schedule-summary-label {
+            font-size: 12px;
+            color: #2c5282;
+            margin-bottom: 3px;
+        }
+        
+        .schedule-summary-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: #2b6cb0;
+        }
+
+        .due-date-box {
+            background: #ebf4ff;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 10px 0;
+            text-align: center;
+            border: 1px solid #667eea;
+        }
+
+        .two-column-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .due-date-label {
+            font-size: 14px;
+            color: #4a5568;
+        }
+
+        .due-date-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #667eea;
+        }
+
+        .overdue-section {
+            margin: 20px 0;
+            padding: 15px;
+            background: #fff5f5;
+            border-radius: 8px;
+            border-left: 4px solid #f56565;
+        }
+
+        .overdue-title {
+            color: #c53030;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .overdue-details-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            font-size: 13px;
+        }
+
+        .overdue-details-table th {
+            background: #fed7d7;
+            color: #c53030;
+            padding: 8px;
+            text-align: left;
+        }
+
+        .overdue-details-table td {
+            padding: 8px;
+            border-bottom: 1px solid #fed7d7;
+        }
+
+        .interest-warning {
+            background: #fef3c7;
+            border-left: 4px solid #ecc94b;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 8px;
+            color: #744210;
         }
 
         .customer-info {
@@ -1498,36 +1649,6 @@ if (!$company) {
             color: #ecc94b;
         }
 
-        .overdue-badge {
-            background: #f56565;
-            color: white;
-            padding: 3px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            display: inline-block;
-        }
-
-        .current-badge {
-            background: #48bb78;
-            color: white;
-            padding: 3px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            display: inline-block;
-        }
-
-        .warning-badge {
-            background: #ecc94b;
-            color: #744210;
-            padding: 3px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            display: inline-block;
-        }
-
         .interest-breakdown {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
@@ -1591,10 +1712,6 @@ if (!$company) {
             border-top: 4px solid #ecc94b;
         }
 
-        .interest-box.current {
-            border-top: 4px solid #f56565;
-        }
-
         .interest-label {
             font-size: 12px;
             color: #718096;
@@ -1616,10 +1733,6 @@ if (!$company) {
 
         .interest-value.due {
             color: #ecc94b;
-        }
-
-        .interest-value.current {
-            color: #f56565;
         }
 
         .payment-actions {
@@ -1660,6 +1773,12 @@ if (!$company) {
             background: #ebf8ff;
         }
 
+        .payment-card.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            pointer-events: none;
+        }
+
         .payment-card-icon {
             font-size: 48px;
             margin-bottom: 15px;
@@ -1698,19 +1817,22 @@ if (!$company) {
             color: #718096;
         }
 
-        .payment-card.disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            pointer-events: none;
+        .warning-badge {
+            background: #ecc94b;
+            color: #744210;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            display: inline-block;
         }
 
-        .items-table {
+        .items-table, .payment-table {
             width: 100%;
             border-collapse: collapse;
-            margin: 20px 0;
         }
 
-        .items-table th {
+        .items-table th, .payment-table th {
             background: #f7fafc;
             padding: 12px;
             text-align: left;
@@ -1720,34 +1842,10 @@ if (!$company) {
             border-bottom: 2px solid #e2e8f0;
         }
 
-        .items-table td {
+        .items-table td, .payment-table td {
             padding: 12px;
             border-bottom: 1px solid #e2e8f0;
             font-size: 14px;
-        }
-
-        .payment-history {
-            margin-top: 20px;
-        }
-
-        .payment-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .payment-table th {
-            background: #f7fafc;
-            padding: 12px;
-            text-align: left;
-            font-size: 13px;
-            font-weight: 600;
-            color: #4a5568;
-            border-bottom: 2px solid #e2e8f0;
-        }
-
-        .payment-table td {
-            padding: 12px;
-            border-bottom: 1px solid #e2e8f0;
         }
 
         .interest-highlight {
@@ -1762,16 +1860,10 @@ if (!$company) {
             color: #2c5282;
         }
 
-        .overdue-highlight {
-            background: #f5656520;
-            font-weight: 600;
-            color: #c53030;
-        }
-
-        .charge-highlight {
-            background: #4299e120;
-            font-weight: 600;
-            color: #2b6cb0;
+        .total-highlight {
+            background: #48bb7820;
+            font-weight: 700;
+            color: #276749;
         }
 
         .both-highlight {
@@ -1780,20 +1872,11 @@ if (!$company) {
             color: #553c9a;
         }
 
-        .total-highlight {
-            background: #48bb7820;
-            font-weight: 700;
-            color: #276749;
+        .text-right {
+            text-align: right;
         }
 
-        .collection-employee {
-            background: #ebf4ff;
-            border-left: 4px solid #667eea;
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 8px;
-        }
-
+        /* Modal Styles */
         .modal {
             display: none;
             position: fixed;
@@ -1802,7 +1885,7 @@ if (!$company) {
             width: 100%;
             height: 100%;
             background: rgba(0,0,0,0.5);
-            z-index: 1000;
+            z-index: 9999;
             justify-content: center;
             align-items: center;
         }
@@ -1815,10 +1898,11 @@ if (!$company) {
             background: white;
             border-radius: 12px;
             padding: 30px;
-            max-width: 800px;
+            max-width: 600px;
             width: 95%;
             max-height: 90vh;
             overflow-y: auto;
+            position: relative;
         }
 
         .modal-title {
@@ -1829,7 +1913,9 @@ if (!$company) {
         }
 
         .modal-close {
-            float: right;
+            position: absolute;
+            right: 20px;
+            top: 20px;
             cursor: pointer;
             font-size: 24px;
             color: #a0aec0;
@@ -1865,93 +1951,72 @@ if (!$company) {
             display: block;
         }
 
-        .due-date-box {
-            background: #ebf4ff;
-            border-radius: 10px;
-            padding: 15px;
-            margin: 10px 0;
-            text-align: center;
-            border: 1px solid #667eea;
+        .form-group {
+            margin-bottom: 15px;
         }
 
-        .due-date-label {
-            font-size: 14px;
-            color: #4a5568;
-        }
-
-        .due-date-value {
-            font-size: 24px;
-            font-weight: 700;
-            color: #667eea;
-        }
-
-        .interest-warning {
-            background: #fef3c7;
-            border-left: 4px solid #ecc94b;
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 8px;
-            color: #744210;
-        }
-
-        .quick-stats {
-            display: flex;
-            gap: 20px;
-            margin-top: 20px;
-            padding: 15px;
-            background: #f7fafc;
-            border-radius: 8px;
-            flex-wrap: wrap;
-        }
-
-        /* Overdue specific styles */
-        .overdue-section {
-            margin: 20px 0;
-            padding: 15px;
-            background: #fff5f5;
-            border-radius: 8px;
-            border-left: 4px solid #f56565;
-        }
-
-        .overdue-title {
-            color: #c53030;
-            font-weight: 600;
-            margin-bottom: 10px;
-        }
-
-        .overdue-amount {
-            font-size: 24px;
-            font-weight: 700;
-            color: #c53030;
+        .form-label {
+            display: block;
             margin-bottom: 5px;
+            font-weight: 600;
+            color: #4a5568;
+            font-size: 14px;
         }
 
-        .overdue-note {
-            font-size: 13px;
-            color: #742a2a;
+        .form-label.required:after {
+            content: "*";
+            color: #f56565;
+            margin-left: 4px;
         }
 
-        .overdue-details-table {
+        .form-control, .form-select {
             width: 100%;
-            border-collapse: collapse;
+            padding: 10px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .form-control:focus, .form-select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        .bank-selection {
             margin-top: 15px;
-            font-size: 13px;
+            padding: 15px;
+            background: #ebf8ff;
+            border-radius: 8px;
+            border-left: 4px solid #4299e1;
+            display: none;
         }
 
-        .overdue-details-table th {
-            background: #fed7d7;
-            color: #c53030;
-            padding: 8px;
-            text-align: left;
+        .bank-selection.show {
+            display: block;
         }
 
-        .overdue-details-table td {
-            padding: 8px;
-            border-bottom: 1px solid #fed7d7;
+        .summary-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px dashed #e2e8f0;
         }
 
-        .overdue-details-table tr:last-child td {
+        .summary-row.total {
+            border-top: 2px solid #667eea;
             border-bottom: none;
+            margin-top: 10px;
+            padding-top: 10px;
+            font-weight: 700;
+        }
+
+        .three-column-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
         }
 
         .display-card {
@@ -2019,186 +2084,28 @@ if (!$company) {
             color: #667eea;
         }
 
-        .grand-total-note {
-            font-size: 12px;
-            color: #718096;
-            margin-top: 5px;
-        }
-
-        .summary-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 10px 0;
-            border-bottom: 1px dashed #e2e8f0;
-        }
-
-        .summary-row.total {
-            border-top: 2px solid #667eea;
-            border-bottom: none;
-            margin-top: 10px;
-            padding-top: 10px;
-            font-weight: 700;
-        }
-
-        .summary-interest {
-            color: #ecc94b;
-            font-weight: 600;
-        }
-
-        .summary-overdue {
-            color: #f56565;
-            font-weight: 600;
-        }
-
-        .summary-charge {
-            color: #4299e1;
-            font-weight: 600;
-        }
-
-        .summary-grand {
-            color: #667eea;
-            font-size: 18px;
-        }
-
-        .three-column-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-
-        .two-column-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-
-        /* Bank Account Selection Styles */
-        .bank-selection {
-            margin-top: 15px;
-            padding: 15px;
-            background: #ebf8ff;
-            border-radius: 8px;
-            border-left: 4px solid #4299e1;
-            display: none;
-        }
-
-        .bank-selection.show {
-            display: block;
-        }
-
-        .bank-selection label {
-            color: #2c5282;
-            font-weight: 600;
-        }
-
-        .bank-option {
-            padding: 8px;
-            border-bottom: 1px solid #e2e8f0;
-        }
-
-        .bank-option:last-child {
-            border-bottom: none;
-        }
-
-        .bank-details {
-            font-size: 12px;
-            color: #718096;
-            margin-top: 2px;
-        }
-
-        .bank-balance {
-            color: #48bb78;
-            font-weight: 600;
-        }
-
-        /* Balance Summary Styles */
-        .balance-summary {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
-            margin: 20px 0;
-            padding: 20px;
-            background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
-            border-radius: 12px;
-        }
-
-        .balance-box {
-            text-align: center;
-            padding: 15px;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-        }
-
-        .balance-box.principal {
-            border-top: 4px solid #4299e1;
-        }
-
-        .balance-box.interest {
-            border-top: 4px solid #ecc94b;
-        }
-
-        .balance-box.total {
-            border-top: 4px solid #48bb78;
-        }
-
-        .balance-label {
+        .email-sent-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #48bb78;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 30px;
             font-size: 14px;
-            color: #718096;
-            margin-bottom: 5px;
         }
 
-        .balance-value {
-            font-size: 24px;
-            font-weight: 700;
-        }
-
-        .balance-value.principal {
-            color: #4299e1;
-        }
-
-        .balance-value.interest {
-            color: #ecc94b;
-        }
-
-        .balance-value.total {
-            color: #48bb78;
-        }
-
-        .balance-note {
-            font-size: 12px;
-            color: #a0aec0;
-            margin-top: 5px;
-        }
-
-        .progress-container {
-            margin: 15px 0;
-            background: #edf2f7;
-            border-radius: 10px;
-            height: 10px;
-            overflow: hidden;
-        }
-
-        .progress-bar {
-            height: 100%;
-            background: linear-gradient(90deg, #4299e1, #48bb78);
-            border-radius: 10px;
-            transition: width 0.3s ease;
-        }
-
-        @media (max-width: 1200px) {
-            .loan-summary {
-                grid-template-columns: repeat(3, 1fr);
+        @media (max-width: 768px) {
+            .page-content {
+                padding: 15px;
             }
             
-            .interest-summary {
-                grid-template-columns: repeat(2, 1fr);
+            .loan-summary, .interest-summary, .interest-breakdown, .balance-summary {
+                grid-template-columns: 1fr;
             }
             
-            .interest-breakdown {
-                grid-template-columns: repeat(2, 1fr);
+            .payment-actions {
+                grid-template-columns: 1fr;
             }
             
             .customer-info {
@@ -2210,53 +2117,20 @@ if (!$company) {
                 margin: 0 auto;
             }
             
-            .payment-actions {
-                grid-template-columns: 1fr;
-            }
-            
-            .balance-summary {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        @media (max-width: 768px) {
             .customer-details {
                 grid-template-columns: 1fr;
             }
             
-            .loan-summary {
+            .two-column-grid, .three-column-grid {
                 grid-template-columns: 1fr;
             }
             
-            .interest-summary {
-                grid-template-columns: 1fr;
+            .schedule-table {
+                font-size: 12px;
             }
             
-            .interest-breakdown {
-                grid-template-columns: 1fr;
-            }
-            
-            .items-table, .payment-table {
-                overflow-x: auto;
-                display: block;
-            }
-            
-            .quick-stats {
-                flex-direction: column;
-                gap: 10px;
-            }
-            
-            .three-column-grid, .two-column-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .search-result-item {
-                padding: 12px;
-            }
-            
-            .result-details {
-                flex-direction: column;
-                gap: 5px;
+            .schedule-table th, .schedule-table td {
+                padding: 8px;
             }
         }
     </style>
@@ -2278,9 +2152,16 @@ if (!$company) {
                             <span class="interest-badge">Interest</span>
                             <span class="principal-badge">Principal</span>
                         </h1>
-                        <a href="New-Loan.php" class="btn btn-secondary">
-                            <i class="bi bi-arrow-left"></i> Back to Loans
-                        </a>
+                        <div>
+                            <?php if (isset($_GET['email']) && $_GET['email'] == 'sent'): ?>
+                                <span class="email-sent-badge">
+                                    <i class="bi bi-envelope-check-fill"></i> Email Sent
+                                </span>
+                            <?php endif; ?>
+                            <a href="New-Loan.php" class="btn btn-secondary">
+                                <i class="bi bi-arrow-left"></i> Back to Loans
+                            </a>
+                        </div>
                     </div>
 
                     <!-- Alert Messages -->
@@ -2299,7 +2180,6 @@ if (!$company) {
                             Search Open Loans
                         </div>
 
-                        <!-- Live Search Input -->
                         <div class="live-search-container">
                             <i class="bi bi-search search-icon"></i>
                             <input type="text" class="live-search-input" id="liveSearch" 
@@ -2308,32 +2188,24 @@ if (!$company) {
                                    autocomplete="off">
                             <i class="bi bi-x-circle clear-search" id="clearSearch" onclick="clearSearch()"></i>
                             
-                            <!-- Search Results Dropdown -->
                             <div class="search-results" id="searchResults"></div>
                         </div>
 
-                        <!-- Search Stats -->
                         <div class="search-stats">
                             <span id="searchStats">Type at least 2 characters to search</span>
                             <span id="resultCount"></span>
                         </div>
 
-                        <!-- Quick Stats -->
                         <?php
                         if ($open_loans_result) {
                             mysqli_data_seek($open_loans_result, 0);
                             $total_principal_query = "SELECT SUM(loan_amount) as total FROM loans WHERE status = 'open'";
                             $total_result = mysqli_query($conn, $total_principal_query);
                             $total_data = mysqli_fetch_assoc($total_result);
-                            
-                            $total_overdue_query = "SELECT SUM(total_overdue_amount) as total_overdue FROM loans WHERE status = 'open'";
-                            $total_overdue_result = mysqli_query($conn, $total_overdue_query);
-                            $total_overdue_data = mysqli_fetch_assoc($total_overdue_result);
                         ?>
                         <div class="quick-stats">
                             <div><strong>Total Open Loans:</strong> <?php echo mysqli_num_rows($open_loans_result); ?></div>
                             <div><strong>Total Outstanding:</strong> ₹ <?php echo number_format($total_data['total'] ?? 0, 0); ?></div>
-                            <div><strong>Total Overdue:</strong> <span style="color: #f56565;">₹ <?php echo number_format($total_overdue_data['total_overdue'] ?? 0, 2); ?></span></div>
                         </div>
                         <?php } ?>
                     </div>
@@ -2345,7 +2217,7 @@ if (!$company) {
                                 <i class="bi bi-receipt"></i> Receipt #<?php echo $loan['receipt_number']; ?>
                             </span>
                             <?php if ($overdue_details['has_overdue']): ?>
-                                <span class="overdue-badge" style="background: #f56565; color: white; padding: 8px 20px; border-radius: 50px; font-size: 18px; font-weight: 600; display: inline-block; margin-left: 10px;">
+                                <span class="overdue-badge">
                                     <i class="bi bi-exclamation-triangle-fill"></i> Overdue: ₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?>
                                 </span>
                             <?php endif; ?>
@@ -2372,11 +2244,94 @@ if (!$company) {
 
                         <!-- Progress Bar -->
                         <?php 
-                        $paid_percentage = ($total_principal_paid / $loan['loan_amount']) * 100;
+                        $paid_percentage = $loan['loan_amount'] > 0 ? ($total_principal_paid / $loan['loan_amount']) * 100 : 0;
                         ?>
                         <div class="progress-container no-print">
                             <div class="progress-bar" style="width: <?php echo $paid_percentage; ?>%;"></div>
                         </div>
+
+                        <!-- Monthly Interest Schedule Table -->
+                        <?php if (!empty($monthly_schedule)): ?>
+                        <div class="info-card no-print">
+                            <div class="section-title">
+                                <i class="bi bi-calendar-month"></i>
+                                Monthly Interest Schedule
+                                <small style="font-size: 12px; color: #718096; margin-left: 10px;">Interest calculated on remaining principal</small>
+                            </div>
+                            
+                            <div class="monthly-schedule">
+                                <table class="schedule-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Month</th>
+                                            <th>Period</th>
+                                            <th>Interest Amount (₹)</th>
+                                            <th>Status</th>
+                                            <th>Receipt</th>
+                                            <th>Action</th>
+                                        </thead>
+                                    <tbody>
+                                        <?php foreach ($monthly_schedule as $schedule): ?>
+                                        <tr>
+                                            <td><strong><?php echo $schedule['month_display']; ?></strong></td>
+                                            <td><?php echo date('d/m/Y', strtotime($schedule['month_start'])) . ' - ' . date('d/m/Y', strtotime($schedule['month_end'])); ?></td>
+                                            <td class="interest-highlight">₹ <?php echo number_format($schedule['interest_amount'], 2); ?></td>
+                                            <td>
+                                                <?php if ($schedule['status'] == 'paid'): ?>
+                                                    <span class="status-paid">
+                                                        <i class="bi bi-check-circle-fill"></i> Paid
+                                                    </span>
+                                                <?php elseif ($schedule['status'] == 'overdue'): ?>
+                                                    <span class="status-overdue">
+                                                        <i class="bi bi-exclamation-triangle-fill"></i> Overdue
+                                                    </span>
+                                                <?php else: ?>
+                                                    <span class="status-pending">
+                                                        <i class="bi bi-clock"></i> Pending
+                                                    </span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <?php if ($schedule['payment_receipt']): ?>
+                                                    <a href="bill-receipt.php?receipt=<?php echo urlencode($schedule['payment_receipt']); ?>" class="receipt-link" target="_blank">
+                                                        <?php echo $schedule['payment_receipt']; ?>
+                                                    </a>
+                                                    <br><small><?php echo $schedule['payment_date']; ?></small>
+                                                <?php else: ?>
+                                                    -
+                                                <?php endif; ?>
+                                            </td>
+                                            <td>
+                                                <?php if ($schedule['status'] == 'pending' || $schedule['status'] == 'overdue'): ?>
+                                                    <button type="button" class="btn-pay-monthly" onclick="showMonthlyInterestModal('<?php echo $schedule['month']; ?>', '<?php echo $schedule['month_display']; ?>', <?php echo $schedule['interest_amount']; ?>)">
+                                                        <i class="bi bi-cash"></i> Pay Now
+                                                    </button>
+                                                <?php else: ?>
+                                                    <span style="color: #48bb78;"><i class="bi bi-check-lg"></i> Completed</span>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                            
+                            <div class="schedule-summary">
+                                <div class="schedule-summary-item">
+                                    <div class="schedule-summary-label">Total Interest Paid</div>
+                                    <div class="schedule-summary-value">₹ <?php echo number_format($total_interest_paid, 2); ?></div>
+                                </div>
+                                <div class="schedule-summary-item">
+                                    <div class="schedule-summary-label">Pending Interest</div>
+                                    <div class="schedule-summary-value">₹ <?php echo number_format($pending_interest, 2); ?></div>
+                                </div>
+                                <div class="schedule-summary-item">
+                                    <div class="schedule-summary-label">Monthly Interest Rate</div>
+                                    <div class="schedule-summary-value"><?php echo $overdue_details['regular_rate']; ?>%</div>
+                                </div>
+                            </div>
+                        </div>
+                        <?php endif; ?>
 
                         <!-- Due Date Information -->
                         <div class="due-date-box no-print">
@@ -2411,8 +2366,7 @@ if (!$company) {
                                         <th>Days Overdue</th>
                                         <th>Rate</th>
                                         <th>Overdue Amount</th>
-                                    </tr>
-                                </thead>
+                                    </thead>
                                 <tbody>
                                     <?php foreach ($overdue_details['overdue_details'] as $overdue): ?>
                                     <tr>
@@ -2480,6 +2434,12 @@ if (!$company) {
                                             <div class="detail-value"><?php echo htmlspecialchars($customer['whatsapp']); ?></div>
                                         </div>
                                     <?php endif; ?>
+                                    <?php if (!empty($customer['email'])): ?>
+                                        <div class="detail-item">
+                                            <div class="detail-label">Email</div>
+                                            <div class="detail-value"><?php echo htmlspecialchars($customer['email']); ?></div>
+                                        </div>
+                                    <?php endif; ?>
                                     <div class="detail-item">
                                         <div class="detail-label">Address</div>
                                         <div class="detail-value"><?php echo htmlspecialchars($customer['address']); ?></div>
@@ -2488,7 +2448,7 @@ if (!$company) {
                             </div>
                         </div>
 
-                        <!-- Loan Summary with Remaining Principal -->
+                        <!-- Loan Details -->
                         <div class="info-card no-print">
                             <div class="section-title">
                                 <i class="bi bi-info-circle"></i>
@@ -2556,24 +2516,17 @@ if (!$company) {
 
                             <!-- Collection Actions -->
                             <div class="payment-actions">
-                                <!-- Interest Collection Card -->
                                 <div class="payment-card interest" onclick="showInterestModal()">
                                     <div class="payment-card-icon interest">
                                         <i class="bi bi-percent"></i>
                                     </div>
-                                    <div class="payment-card-title">Collect Interest</div>
-                                    <div class="payment-card-amount interest">₹ <?php echo number_format($current_interest_due, 2); ?></div>
+                                    <div class="payment-card-title">Collect All Interest</div>
+                                    <div class="payment-card-amount interest">₹ <?php echo number_format($current_interest_due + $overdue_details['total_overdue'], 2); ?></div>
                                     <div class="payment-card-note">
-                                        <small>Pending: ₹ <?php echo number_format($pending_interest, 2); ?></small>
+                                        <small>Current + Overdue</small>
                                     </div>
-                                    <?php if ($overdue_details['has_overdue']): ?>
-                                    <div class="payment-card-note">
-                                        <span class="warning-badge">+ Overdue: ₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?></span>
-                                    </div>
-                                    <?php endif; ?>
                                 </div>
 
-                                <!-- Principal Payment Card -->
                                 <div class="payment-card principal <?php echo ($interest_overdue) ? 'disabled' : ''; ?>" 
                                      onclick="<?php echo (!$interest_overdue) ? 'showPrincipalModal()' : ''; ?>">
                                     <div class="payment-card-icon principal">
@@ -2609,8 +2562,7 @@ if (!$company) {
                                         <th>Stone</th>
                                         <th>Weight (g)</th>
                                         <th>Qty</th>
-                                    </tr>
-                                </thead>
+                                    </thead>
                                 <tbody>
                                     <?php foreach ($items as $item): ?>
                                     <tr>
@@ -2627,7 +2579,7 @@ if (!$company) {
                         </div>
                         <?php endif; ?>
 
-                        <!-- Payment History with Balance Tracking -->
+                        <!-- Payment History -->
                         <?php if (!empty($payments)): ?>
                         <div class="info-card no-print">
                             <div class="section-title">
@@ -2646,8 +2598,7 @@ if (!$company) {
                                         <th class="text-right">Total (₹)</th>
                                         <th>Mode</th>
                                         <th>Collected By</th>
-                                    </tr>
-                                </thead>
+                                    </thead>
                                 <tbody>
                                     <?php foreach ($payments as $payment): ?>
                                     <tr>
@@ -2655,11 +2606,11 @@ if (!$company) {
                                         <td><strong><?php echo $payment['receipt_number']; ?></strong></td>
                                         <td>
                                             <?php if ($payment['principal_amount'] > 0 && $payment['interest_amount'] > 0): ?>
-                                                <span class="badge both-highlight">Both</span>
+                                                <span class="both-highlight">Both</span>
                                             <?php elseif ($payment['principal_amount'] > 0): ?>
-                                                <span class="badge principal-highlight">Principal</span>
+                                                <span class="principal-highlight">Principal</span>
                                             <?php elseif ($payment['interest_amount'] > 0): ?>
-                                                <span class="badge interest-highlight">Interest</span>
+                                                <span class="interest-highlight">Interest</span>
                                             <?php endif; ?>
                                         </td>
                                         <td class="text-right principal-highlight">
@@ -2685,286 +2636,165 @@ if (!$company) {
         </div>
     </div>
 
-    <!-- Interest Collection Modal with Balance Tracking -->
-    <div class="modal no-print" id="interestModal">
+    <!-- Monthly Interest Payment Modal -->
+    <div class="modal" id="monthlyInterestModal">
         <div class="modal-content">
-            <span class="modal-close" onclick="hideInterestModal()">&times;</span>
-            <h3 class="modal-title">Collect Interest</h3>
+            <span class="modal-close" onclick="hideMonthlyInterestModal()">&times;</span>
+            <h3 class="modal-title">Pay Monthly Interest</h3>
             
-            <?php if ($loan && $overdue_details): ?>
-            <form method="POST" action="" id="interestForm">
-                <input type="hidden" name="action" value="collect_interest">
-                <input type="hidden" name="loan_id" value="<?php echo $loan['id']; ?>">
-                <input type="hidden" name="receipt_number" value="<?php echo $loan['receipt_number']; ?>">
+            <form method="POST" action="" id="monthlyInterestForm">
+                <input type="hidden" name="action" value="pay_monthly_interest">
+                <input type="hidden" name="loan_id" value="<?php echo $loan['id'] ?? ''; ?>">
+                <input type="hidden" name="receipt_number" value="<?php echo $loan['receipt_number'] ?? ''; ?>">
+                <input type="hidden" name="month_key" id="month_key">
+                <input type="hidden" name="interest_amount" id="monthly_interest_amount">
                 
-                <!-- Current Balances -->
-                <div class="balance-summary" style="margin-bottom: 20px;">
-                    <div class="balance-box principal">
-                        <div class="balance-label">Current Principal</div>
-                        <div class="balance-value principal">₹ <?php echo number_format($remaining_principal, 2); ?></div>
-                    </div>
-                    <div class="balance-box interest">
-                        <div class="balance-label">Pending Interest</div>
-                        <div class="balance-value interest">₹ <?php echo number_format($pending_interest, 2); ?></div>
-                    </div>
+                <div class="amount-display interest" id="monthlyInterestDisplay">
+                    ₹ 0.00
+                    <small>Monthly Interest Payment</small>
                 </div>
-
-                <!-- Three Column Display for Amounts -->
-                <div class="three-column-grid">
-                    <!-- Interest Amount Display -->
-                    <div class="display-card interest-card">
-                        <div class="display-label">Current Interest Due</div>
-                        <div class="display-value interest" id="displayInterestAmount">₹ <?php echo number_format($current_interest_due, 2); ?></div>
-                        <small style="color: #744210;">Based on ₹<?php echo number_format($remaining_principal, 0); ?> principal</small>
-                    </div>
-
-                    <!-- Overdue Amount Display -->
-                    <div class="display-card overdue-card">
-                        <div class="display-label">Total Overdue</div>
-                        <div class="display-value overdue" id="displayOverdueAmount">₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?></div>
-                        <small style="color: #742a2a;">Past Due Amounts</small>
-                    </div>
-
-                    <!-- Overdue Charge Display -->
-                    <div class="display-card charge-card">
-                        <div class="display-label">Overdue Charge</div>
-                        <div class="display-value charge" id="displayChargeAmount">₹ 0.00</div>
-                        <small style="color: #2b6cb0;">Additional Penalty</small>
-                    </div>
-                </div>
-
-                <!-- Grand Total Display -->
-                <div class="grand-total-box">
-                    <div class="grand-total-label">GRAND TOTAL</div>
-                    <div class="grand-total-value" id="grandTotalAmount">₹ <?php echo number_format($current_interest_due + $overdue_details['total_overdue'], 2); ?></div>
-                    <div class="grand-total-note">Interest + Overdue + Charges</div>
-                </div>
-
-                <!-- Three Column Input Fields -->
-                <div class="three-column-grid">
-                    <!-- Interest Input -->
-                    <div class="form-group">
-                        <label class="form-label required">Interest (₹)</label>
-                        <div class="input-group">
-                            <i class="bi bi-percent input-icon" style="color: #ecc94b;"></i>
-                            <input type="number" class="form-control" name="interest_amount" id="interest_amount" 
-                                   value="<?php echo $current_interest_due; ?>" step="0.01" min="0" 
-                                   max="<?php echo $current_interest_due; ?>" required onchange="updateTotals()">
-                        </div>
-                        <small style="color: #718096;">Max: ₹ <?php echo number_format($current_interest_due, 2); ?></small>
-                    </div>
-
-                    <!-- Overdue Input -->
-                    <?php if ($overdue_details['has_overdue']): ?>
-                    <div class="form-group">
-                        <label class="form-label">Overdue (₹)</label>
-                        <div class="input-group">
-                            <i class="bi bi-exclamation-triangle input-icon" style="color: #f56565;"></i>
-                            <input type="number" class="form-control" name="overdue_amount" id="overdue_amount" 
-                                   value="<?php echo $overdue_details['total_overdue']; ?>" step="0.01" min="0" 
-                                   max="<?php echo $overdue_details['total_overdue']; ?>" onchange="updateTotals()">
-                        </div>
-                        <small style="color: #f56565;">Max: ₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?></small>
-                    </div>
-                    <?php else: ?>
-                    <div class="form-group">
-                        <label class="form-label">Overdue (₹)</label>
-                        <div class="input-group">
-                            <i class="bi bi-exclamation-triangle input-icon" style="color: #f56565;"></i>
-                            <input type="number" class="form-control" name="overdue_amount" id="overdue_amount" 
-                                   value="0" step="0.01" min="0" readonly>
-                        </div>
-                        <small style="color: #718096;">No overdue</small>
-                    </div>
-                    <?php endif; ?>
-
-                    <!-- Overdue Charge Input -->
-                    <div class="form-group">
-                        <label class="form-label">Overdue Charge (₹)</label>
-                        <div class="input-group">
-                            <i class="bi bi-exclamation-circle input-icon" style="color: #4299e1;"></i>
-                            <input type="number" class="form-control" name="overdue_charge" id="overdue_charge" 
-                                   value="0" step="0.01" min="0" onchange="updateTotals()">
-                        </div>
-                        <small style="color: #4299e1;">Additional penalty fee</small>
-                    </div>
-                </div>
-
-                <!-- Payment Date and Employee - Two Column -->
-                <div class="two-column-grid">
-                    <div class="form-group">
-                        <label class="form-label required">Payment Date</label>
-                        <input type="date" class="form-control" name="payment_date" value="<?php echo date('Y-m-d'); ?>" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label required">Collecting Employee</label>
-                        <div class="input-group">
-                            <i class="bi bi-person-badge input-icon"></i>
-                            <select class="form-select" name="collection_employee_id" required>
-                                <option value="">Select Employee</option>
-                                <?php 
-                                if ($employees_result) {
-                                    mysqli_data_seek($employees_result, 0);
-                                    while($emp = mysqli_fetch_assoc($employees_result)): 
-                                ?>
-                                    <option value="<?php echo $emp['id']; ?>" <?php echo ($_SESSION['user_id'] == $emp['id']) ? 'selected' : ''; ?>>
-                                        <?php echo htmlspecialchars($emp['name']); ?> (<?php echo ucfirst($emp['role']); ?>)
-                                    </option>
-                                <?php 
-                                    endwhile;
-                                } 
-                                ?>
-                            </select>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Payment Mode -->
+                
                 <div class="form-group">
-                    <label class="form-label required">Payment Mode</label>
-                    <select class="form-select" name="payment_mode" id="payment_mode" required onchange="toggleBankSelection()">
-                        <option value="cash">Cash</option>
-                        <option value="bank">Bank Transfer</option>
-                        <option value="upi">UPI</option>
-                        <option value="other">Other</option>
-                    </select>
+                    <label class="form-label required">Payment Date</label>
+                    <input type="date" class="form-control" name="payment_date" value="<?php echo date('Y-m-d'); ?>" required>
                 </div>
-
-                <!-- Bank Account Selection (shown only for bank mode) -->
-                <div class="bank-selection" id="bank_selection">
-                    <label class="form-label required">Select Bank Account</label>
-                    <select class="form-select" name="bank_account_id" id="bank_account_id">
-                        <option value="">Select Bank Account</option>
+                
+                <div class="form-group">
+                    <label class="form-label required">Collecting Employee</label>
+                    <select class="form-select" name="collection_employee_id" required>
+                        <option value="">Select Employee</option>
                         <?php 
-                        if ($bank_accounts_result) {
-                            mysqli_data_seek($bank_accounts_result, 0);
-                            while($bank = mysqli_fetch_assoc($bank_accounts_result)): 
-                                // Get current balance
-                                $balance_query = "SELECT balance FROM bank_ledger 
-                                                WHERE bank_account_id = {$bank['id']} 
-                                                ORDER BY id DESC LIMIT 1";
-                                $balance_result = mysqli_query($conn, $balance_query);
-                                if (mysqli_num_rows($balance_result) > 0) {
-                                    $current_balance = mysqli_fetch_assoc($balance_result)['balance'];
-                                } else {
-                                    $current_balance = $bank['opening_balance'];
-                                }
+                        if ($employees_result) {
+                            mysqli_data_seek($employees_result, 0);
+                            while($emp = mysqli_fetch_assoc($employees_result)): 
                         ?>
-                            <option value="<?php echo $bank['id']; ?>" data-balance="<?php echo $current_balance; ?>">
-                                <?php echo $bank['bank_full_name']; ?> - <?php echo $bank['account_holder_no']; ?> (A/C: <?php echo substr($bank['bank_account_no'], -4); ?>)
+                            <option value="<?php echo $emp['id']; ?>" <?php echo ($_SESSION['user_id'] == $emp['id']) ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars($emp['name']); ?> (<?php echo ucfirst($emp['role']); ?>)
                             </option>
                         <?php 
                             endwhile;
                         } 
                         ?>
                     </select>
-                    <small class="form-text text-muted">The amount will be credited to the selected bank account</small>
                 </div>
-
-                <!-- Remarks -->
+                
                 <div class="form-group">
-                    <label class="form-label">Remarks (Optional)</label>
-                    <textarea class="form-control" name="remarks" rows="2" placeholder="Add any notes about this collection">Interest Collection</textarea>
+                    <label class="form-label required">Payment Mode</label>
+                    <select class="form-select" name="payment_mode" id="monthly_payment_mode" required onchange="toggleMonthlyBankSelection()">
+                        <option value="cash">Cash</option>
+                        <option value="bank">Bank Transfer</option>
+                        <option value="upi">UPI</option>
+                        <option value="other">Other</option>
+                    </select>
                 </div>
-
-                <!-- Detailed Summary -->
-                <div style="background: #f7fafc; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #e2e8f0;">
-                    <h4 style="margin: 0 0 15px 0; color: #2d3748; font-size: 16px;">Payment Summary</h4>
-                    
-                    <div class="two-column-grid">
-                        <div class="summary-row">
-                            <span style="color: #ecc94b; font-weight: 600;">Current Interest:</span>
-                            <span class="summary-interest" id="summaryInterest">₹ <?php echo number_format($current_interest_due, 2); ?></span>
-                        </div>
-                        <div class="summary-row">
-                            <span style="color: #f56565; font-weight: 600;">Overdue Amount:</span>
-                            <span class="summary-overdue" id="summaryOverdue">₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?></span>
-                        </div>
-                        <div class="summary-row">
-                            <span style="color: #4299e1; font-weight: 600;">Overdue Charge:</span>
-                            <span class="summary-charge" id="summaryCharge">₹ 0.00</span>
-                        </div>
-                        <div class="summary-row total">
-                            <span style="font-weight: 700;">Grand Total:</span>
-                            <span class="summary-grand" id="summaryTotal">₹ <?php echo number_format($current_interest_due + $overdue_details['total_overdue'], 2); ?></span>
-                        </div>
-                    </div>
-                    
-                    <div style="border-top: 2px dashed #e2e8f0; padding-top: 15px; margin-top: 10px;">
-                        <div style="display: flex; justify-content: space-between; font-size: 14px; color: #4a5568;">
-                            <span>Remaining Principal:</span>
-                            <span class="font-weight-600">₹ <?php echo number_format($remaining_principal, 2); ?></span>
-                        </div>
-                        <div style="display: flex; justify-content: space-between; font-size: 14px; color: #4a5568;">
-                            <span>Pending Interest After Payment:</span>
-                            <span class="font-weight-600" id="remainingInterestAfter">₹ <?php echo number_format($pending_interest - $current_interest_due, 2); ?></span>
-                        </div>
-                    </div>
+                
+                <div class="bank-selection" id="monthly_bank_selection">
+                    <label class="form-label required">Select Bank Account</label>
+                    <select class="form-select" name="bank_account_id" id="monthly_bank_account_id">
+                        <option value="">Select Bank Account</option>
+                        <?php 
+                        if ($bank_accounts_result) {
+                            mysqli_data_seek($bank_accounts_result, 0);
+                            while($bank = mysqli_fetch_assoc($bank_accounts_result)): 
+                        ?>
+                            <option value="<?php echo $bank['id']; ?>">
+                                <?php echo $bank['bank_full_name']; ?> - <?php echo $bank['account_holder_no']; ?>
+                            </option>
+                        <?php 
+                            endwhile;
+                        } 
+                        ?>
+                    </select>
                 </div>
-
-                <!-- Action Buttons -->
-                <div style="display: flex; gap: 10px; justify-content: flex-end;">
-                    <button type="button" class="btn btn-secondary" onclick="hideInterestModal()">Cancel</button>
-                    <button type="submit" class="btn btn-warning" onclick="return confirmCollect()">
-                        <i class="bi bi-check-circle"></i> Collect Payment
+                
+                <div class="form-group">
+                    <label class="form-label">Remarks</label>
+                    <textarea class="form-control" name="remarks" rows="2" id="monthly_remarks"></textarea>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="hideMonthlyInterestModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success" onclick="return confirmMonthlyPayment()">
+                        <i class="bi bi-check-circle"></i> Pay Interest
                     </button>
                 </div>
             </form>
-            <?php endif; ?>
         </div>
     </div>
 
-    <!-- Principal Payment Modal with Balance Tracking -->
-    <div class="modal no-print" id="principalModal">
+    <!-- Interest Collection Modal -->
+    <div class="modal" id="interestModal">
         <div class="modal-content">
-            <span class="modal-close" onclick="hidePrincipalModal()">&times;</span>
-            <h3 class="modal-title">Pay Principal Amount</h3>
+            <span class="modal-close" onclick="hideInterestModal()">&times;</span>
+            <h3 class="modal-title">Collect Interest</h3>
             
-            <?php if ($loan && !$interest_overdue): ?>
-            <form method="POST" action="" id="principalForm">
-                <input type="hidden" name="action" value="pay_principal">
+            <?php if ($loan && $overdue_details): ?>
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="collect_interest">
                 <input type="hidden" name="loan_id" value="<?php echo $loan['id']; ?>">
                 <input type="hidden" name="receipt_number" value="<?php echo $loan['receipt_number']; ?>">
-                <input type="hidden" name="current_interest_due" value="<?php echo $current_interest_due; ?>">
                 
-                <!-- Current Balances -->
-                <div class="balance-summary" style="margin-bottom: 20px;">
-                    <div class="balance-box principal">
+                <div class="balance-summary" style="margin-bottom: 20px; padding: 15px;">
+                    <div class="balance-box principal" style="padding: 10px;">
                         <div class="balance-label">Current Principal</div>
-                        <div class="balance-value principal" id="currentPrincipalDisplay">₹ <?php echo number_format($remaining_principal, 2); ?></div>
+                        <div class="balance-value principal">₹ <?php echo number_format($remaining_principal, 2); ?></div>
                     </div>
-                    <div class="balance-box interest">
+                    <div class="balance-box interest" style="padding: 10px;">
                         <div class="balance-label">Pending Interest</div>
                         <div class="balance-value interest">₹ <?php echo number_format($pending_interest, 2); ?></div>
                     </div>
                 </div>
 
-                <div class="amount-display principal" id="principalDisplayAmount">
-                    ₹ <?php echo number_format($remaining_principal, 2); ?>
-                    <small>Remaining Principal</small>
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label required">Payment Date</label>
-                    <input type="date" class="form-control" name="payment_date" value="<?php echo date('Y-m-d'); ?>" required>
-                </div>
-
-                <div class="form-group">
-                    <label class="form-label required">Principal Amount (₹)</label>
-                    <div class="input-group">
-                        <i class="bi bi-cash-stack input-icon"></i>
-                        <input type="number" class="form-control" name="principal_amount" id="principal_amount" 
-                               value="<?php echo $remaining_principal; ?>" step="0.01" min="0.01" 
-                               max="<?php echo $remaining_principal; ?>" required onchange="updatePrincipalDisplay()">
+                <div class="three-column-grid">
+                    <div class="display-card interest-card">
+                        <div class="display-label">Current Interest Due</div>
+                        <div class="display-value interest" id="displayInterestAmount">₹ <?php echo number_format($current_interest_due, 2); ?></div>
+                        <small>Based on principal</small>
                     </div>
-                    <small style="color: #718096;">Max: ₹ <?php echo number_format($remaining_principal, 2); ?></small>
+                    <div class="display-card overdue-card">
+                        <div class="display-label">Total Overdue</div>
+                        <div class="display-value overdue" id="displayOverdueAmount">₹ <?php echo number_format($overdue_details['total_overdue'], 2); ?></div>
+                        <small>Past Due Amounts</small>
+                    </div>
+                    <div class="display-card charge-card">
+                        <div class="display-label">Overdue Charge</div>
+                        <div class="display-value charge" id="displayChargeAmount">₹ 0.00</div>
+                        <small>Additional Penalty</small>
+                    </div>
                 </div>
 
-                <div class="form-group">
-                    <label class="form-label required">Collecting Employee</label>
-                    <div class="input-group">
-                        <i class="bi bi-person-badge input-icon"></i>
+                <div class="grand-total-box">
+                    <div class="grand-total-label">GRAND TOTAL</div>
+                    <div class="grand-total-value" id="grandTotalAmount">₹ <?php echo number_format($current_interest_due + $overdue_details['total_overdue'], 2); ?></div>
+                </div>
+
+                <div class="three-column-grid">
+                    <div class="form-group">
+                        <label class="form-label">Interest (₹)</label>
+                        <input type="number" class="form-control" name="interest_amount" id="interest_amount" 
+                               value="<?php echo $current_interest_due; ?>" step="0.01" min="0" 
+                               max="<?php echo $current_interest_due; ?>" onchange="updateTotals()">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Overdue (₹)</label>
+                        <input type="number" class="form-control" name="overdue_amount" id="overdue_amount" 
+                               value="<?php echo $overdue_details['total_overdue']; ?>" step="0.01" min="0" 
+                               max="<?php echo $overdue_details['total_overdue']; ?>" onchange="updateTotals()">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Charge (₹)</label>
+                        <input type="number" class="form-control" name="overdue_charge" id="overdue_charge" 
+                               value="0" step="0.01" min="0" onchange="updateTotals()">
+                    </div>
+                </div>
+
+                <div class="two-column-grid">
+                    <div class="form-group">
+                        <label class="form-label required">Payment Date</label>
+                        <input type="date" class="form-control" name="payment_date" value="<?php echo date('Y-m-d'); ?>" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label required">Collecting Employee</label>
                         <select class="form-select" name="collection_employee_id" required>
                             <option value="">Select Employee</option>
                             <?php 
@@ -2985,6 +2815,111 @@ if (!$company) {
 
                 <div class="form-group">
                     <label class="form-label required">Payment Mode</label>
+                    <select class="form-select" name="payment_mode" id="payment_mode" required onchange="toggleBankSelection()">
+                        <option value="cash">Cash</option>
+                        <option value="bank">Bank Transfer</option>
+                        <option value="upi">UPI</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+
+                <div class="bank-selection" id="bank_selection">
+                    <label class="form-label required">Select Bank Account</label>
+                    <select class="form-select" name="bank_account_id" id="bank_account_id">
+                        <option value="">Select Bank Account</option>
+                        <?php 
+                        if ($bank_accounts_result) {
+                            mysqli_data_seek($bank_accounts_result, 0);
+                            while($bank = mysqli_fetch_assoc($bank_accounts_result)): 
+                        ?>
+                            <option value="<?php echo $bank['id']; ?>">
+                                <?php echo $bank['bank_full_name']; ?> - <?php echo $bank['account_holder_no']; ?>
+                            </option>
+                        <?php 
+                            endwhile;
+                        } 
+                        ?>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label">Remarks</label>
+                    <textarea class="form-control" name="remarks" rows="2">Interest Collection</textarea>
+                </div>
+
+                <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                    <button type="button" class="btn btn-secondary" onclick="hideInterestModal()">Cancel</button>
+                    <button type="submit" class="btn btn-warning" onclick="return confirmCollect()">
+                        <i class="bi bi-check-circle"></i> Collect Payment
+                    </button>
+                </div>
+            </form>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- Principal Payment Modal -->
+    <div class="modal" id="principalModal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hidePrincipalModal()">&times;</span>
+            <h3 class="modal-title">Pay Principal Amount</h3>
+            
+            <?php if ($loan && !$interest_overdue): ?>
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="pay_principal">
+                <input type="hidden" name="loan_id" value="<?php echo $loan['id']; ?>">
+                <input type="hidden" name="receipt_number" value="<?php echo $loan['receipt_number']; ?>">
+                <input type="hidden" name="current_interest_due" value="<?php echo $current_interest_due; ?>">
+                
+                <div class="balance-summary" style="margin-bottom: 20px; padding: 15px;">
+                    <div class="balance-box principal" style="padding: 10px;">
+                        <div class="balance-label">Current Principal</div>
+                        <div class="balance-value principal" id="currentPrincipalDisplay">₹ <?php echo number_format($remaining_principal, 2); ?></div>
+                    </div>
+                    <div class="balance-box interest" style="padding: 10px;">
+                        <div class="balance-label">Pending Interest</div>
+                        <div class="balance-value interest">₹ <?php echo number_format($pending_interest, 2); ?></div>
+                    </div>
+                </div>
+
+                <div class="amount-display principal" id="principalDisplayAmount">
+                    ₹ <?php echo number_format($remaining_principal, 2); ?>
+                    <small>Remaining Principal</small>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label required">Payment Date</label>
+                    <input type="date" class="form-control" name="payment_date" value="<?php echo date('Y-m-d'); ?>" required>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label required">Principal Amount (₹)</label>
+                    <input type="number" class="form-control" name="principal_amount" id="principal_amount" 
+                           value="<?php echo $remaining_principal; ?>" step="0.01" min="0.01" 
+                           max="<?php echo $remaining_principal; ?>" required onchange="updatePrincipalDisplay()">
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label required">Collecting Employee</label>
+                    <select class="form-select" name="collection_employee_id" required>
+                        <option value="">Select Employee</option>
+                        <?php 
+                        if ($employees_result) {
+                            mysqli_data_seek($employees_result, 0);
+                            while($emp = mysqli_fetch_assoc($employees_result)): 
+                        ?>
+                            <option value="<?php echo $emp['id']; ?>" <?php echo ($_SESSION['user_id'] == $emp['id']) ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars($emp['name']); ?> (<?php echo ucfirst($emp['role']); ?>)
+                            </option>
+                        <?php 
+                            endwhile;
+                        } 
+                        ?>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label required">Payment Mode</label>
                     <select class="form-select" name="payment_mode" id="principal_payment_mode" required onchange="togglePrincipalBankSelection()">
                         <option value="cash">Cash</option>
                         <option value="bank">Bank Transfer</option>
@@ -2993,7 +2928,6 @@ if (!$company) {
                     </select>
                 </div>
 
-                <!-- Bank Account Selection for Principal (shown only for bank mode) -->
                 <div class="bank-selection" id="principal_bank_selection">
                     <label class="form-label required">Select Bank Account</label>
                     <select class="form-select" name="bank_account_id" id="principal_bank_account_id">
@@ -3002,34 +2936,23 @@ if (!$company) {
                         if ($bank_accounts_result) {
                             mysqli_data_seek($bank_accounts_result, 0);
                             while($bank = mysqli_fetch_assoc($bank_accounts_result)): 
-                                // Get current balance
-                                $balance_query = "SELECT balance FROM bank_ledger 
-                                                WHERE bank_account_id = {$bank['id']} 
-                                                ORDER BY id DESC LIMIT 1";
-                                $balance_result = mysqli_query($conn, $balance_query);
-                                if (mysqli_num_rows($balance_result) > 0) {
-                                    $current_balance = mysqli_fetch_assoc($balance_result)['balance'];
-                                } else {
-                                    $current_balance = $bank['opening_balance'];
-                                }
                         ?>
-                            <option value="<?php echo $bank['id']; ?>" data-balance="<?php echo $current_balance; ?>">
-                                <?php echo $bank['bank_full_name']; ?> - <?php echo $bank['account_holder_no']; ?> (A/C: <?php echo substr($bank['bank_account_no'], -4); ?>)
+                            <option value="<?php echo $bank['id']; ?>">
+                                <?php echo $bank['bank_full_name']; ?> - <?php echo $bank['account_holder_no']; ?>
                             </option>
                         <?php 
                             endwhile;
                         } 
                         ?>
                     </select>
-                    <small class="form-text text-muted">The amount will be credited to the selected bank account</small>
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">Remarks (Optional)</label>
-                    <textarea class="form-control" name="remarks" rows="2" placeholder="Add any notes about this principal payment">Principal Payment</textarea>
+                    <label class="form-label">Remarks</label>
+                    <textarea class="form-control" name="remarks" rows="2">Principal Payment</textarea>
                 </div>
 
-                <div style="background: #f7fafc; padding: 20px; border-radius: 12px; margin: 20px 0; border: 1px solid #e2e8f0;">
+                <div style="background: #f7fafc; padding: 20px; border-radius: 12px; margin: 20px 0;">
                     <div class="summary-row">
                         <span>Original Principal:</span>
                         <span>₹ <?php echo number_format($loan['loan_amount'], 2); ?></span>
@@ -3059,10 +2982,7 @@ if (!$company) {
         </div>
     </div>
 
-    <!-- Include flatpickr and custom scripts -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script>
         // Initialize date pickers
         flatpickr("input[type=date]", {
@@ -3070,13 +2990,48 @@ if (!$company) {
             maxDate: "today"
         });
 
-        // Store original values
         let originalInterest = <?php echo $current_interest_due ?? 0; ?>;
         let originalOverdue = <?php echo isset($overdue_details) ? $overdue_details['total_overdue'] : 0; ?>;
         let remainingPrincipal = <?php echo $remaining_principal ?? 0; ?>;
         let pendingInterest = <?php echo $pending_interest ?? 0; ?>;
 
-        // Live Search Functionality
+        // Monthly Interest Modal Functions
+        function showMonthlyInterestModal(monthKey, monthDisplay, interestAmount) {
+            document.getElementById('month_key').value = monthKey;
+            document.getElementById('monthly_interest_amount').value = interestAmount;
+            document.getElementById('monthlyInterestDisplay').innerHTML = '₹ ' + interestAmount.toFixed(2) + '<small>Monthly Interest for ' + monthDisplay + '</small>';
+            document.getElementById('monthly_remarks').value = 'Monthly Interest Payment for ' + monthDisplay;
+            document.getElementById('monthlyInterestModal').classList.add('active');
+            document.getElementById('monthly_payment_mode').value = 'cash';
+            document.getElementById('monthly_bank_selection').classList.remove('show');
+        }
+        
+        function hideMonthlyInterestModal() {
+            document.getElementById('monthlyInterestModal').classList.remove('active');
+        }
+        
+        function toggleMonthlyBankSelection() {
+            const paymentMode = document.getElementById('monthly_payment_mode').value;
+            const bankSelection = document.getElementById('monthly_bank_selection');
+            const bankSelect = document.getElementById('monthly_bank_account_id');
+            
+            if (paymentMode === 'bank') {
+                bankSelection.classList.add('show');
+                bankSelect.setAttribute('required', 'required');
+            } else {
+                bankSelection.classList.remove('show');
+                bankSelect.removeAttribute('required');
+            }
+        }
+        
+        function confirmMonthlyPayment() {
+            const amount = document.getElementById('monthly_interest_amount').value;
+            const month = document.getElementById('month_key').value;
+            const monthDisplay = document.getElementById('monthlyInterestDisplay').innerText.split('for ')[1];
+            return confirm(`Pay monthly interest of ₹${amount} for ${monthDisplay}?`);
+        }
+
+        // Live Search
         let searchTimeout;
         const searchInput = document.getElementById('liveSearch');
         const searchResults = document.getElementById('searchResults');
@@ -3084,16 +3039,13 @@ if (!$company) {
         const resultCount = document.getElementById('resultCount');
         const clearBtn = document.getElementById('clearSearch');
 
-        // Show clear button if there's text
         if (searchInput.value.length > 0) {
             clearBtn.style.display = 'block';
         }
 
-        // Search input event
         searchInput.addEventListener('input', function() {
             const term = this.value.trim();
             
-            // Show/hide clear button
             if (term.length > 0) {
                 clearBtn.style.display = 'block';
             } else {
@@ -3104,10 +3056,8 @@ if (!$company) {
                 return;
             }
 
-            // Clear previous timeout
             clearTimeout(searchTimeout);
 
-            // Don't search if less than 2 characters
             if (term.length < 2) {
                 searchResults.classList.remove('show');
                 searchStats.textContent = 'Type at least 2 characters to search';
@@ -3115,12 +3065,10 @@ if (!$company) {
                 return;
             }
 
-            // Show loading
             searchResults.innerHTML = '<div class="loading-indicator"><i class="bi bi-arrow-repeat"></i> Searching...</div>';
             searchResults.classList.add('show');
             searchStats.textContent = `Searching for "${term}"...`;
 
-            // Set timeout to avoid too many requests
             searchTimeout = setTimeout(() => {
                 fetch(`loan-collection.php?ajax_search=1&term=${encodeURIComponent(term)}`)
                     .then(response => response.json())
@@ -3139,7 +3087,6 @@ if (!$company) {
                             searchStats.textContent = `No results for "${term}"`;
                             resultCount.textContent = '';
                         } else {
-                            // Build results HTML
                             let html = '';
                             results.forEach(loan => {
                                 const matchClass = loan.match_type === 'exact' ? 'exact' : '';
@@ -3172,10 +3119,9 @@ if (!$company) {
                         searchStats.textContent = 'Error occurred';
                         resultCount.textContent = '';
                     });
-            }, 300); // 300ms delay
+            }, 300);
         });
 
-        // Clear search
         function clearSearch() {
             searchInput.value = '';
             clearBtn.style.display = 'none';
@@ -3184,19 +3130,17 @@ if (!$company) {
             resultCount.textContent = '';
         }
 
-        // Select loan from search
         function selectLoan(receiptNumber) {
             window.location.href = `loan-collection.php?search=${encodeURIComponent(receiptNumber)}`;
         }
 
-        // Close search results when clicking outside
         document.addEventListener('click', function(event) {
             if (!searchInput.contains(event.target) && !searchResults.contains(event.target)) {
                 searchResults.classList.remove('show');
             }
         });
 
-        // Toggle bank selection for interest modal
+        // Bank Selection Toggles
         function toggleBankSelection() {
             const paymentMode = document.getElementById('payment_mode').value;
             const bankSelection = document.getElementById('bank_selection');
@@ -3211,7 +3155,6 @@ if (!$company) {
             }
         }
 
-        // Toggle bank selection for principal modal
         function togglePrincipalBankSelection() {
             const paymentMode = document.getElementById('principal_payment_mode').value;
             const bankSelection = document.getElementById('principal_bank_selection');
@@ -3229,7 +3172,6 @@ if (!$company) {
         // Interest Modal Functions
         function showInterestModal() {
             document.getElementById('interestModal').classList.add('active');
-            // Reset bank selection
             document.getElementById('payment_mode').value = 'cash';
             document.getElementById('bank_selection').classList.remove('show');
         }
@@ -3238,39 +3180,20 @@ if (!$company) {
             document.getElementById('interestModal').classList.remove('active');
         }
 
-        // Update totals when values change
         function updateTotals() {
             const interestAmount = parseFloat(document.getElementById('interest_amount').value) || 0;
             const overdueAmount = parseFloat(document.getElementById('overdue_amount')?.value || 0);
             const chargeAmount = parseFloat(document.getElementById('overdue_charge')?.value || 0);
             const totalAmount = interestAmount + overdueAmount + chargeAmount;
             
-            // Update display boxes
             document.getElementById('displayInterestAmount').innerHTML = '₹ ' + interestAmount.toFixed(2);
-            
             if (document.getElementById('displayOverdueAmount')) {
                 document.getElementById('displayOverdueAmount').innerHTML = '₹ ' + overdueAmount.toFixed(2);
             }
-            
             document.getElementById('displayChargeAmount').innerHTML = '₹ ' + chargeAmount.toFixed(2);
             document.getElementById('grandTotalAmount').innerHTML = '₹ ' + totalAmount.toFixed(2);
-            
-            // Update summary
-            document.getElementById('summaryInterest').innerHTML = '₹ ' + interestAmount.toFixed(2);
-            
-            if (document.getElementById('summaryOverdue')) {
-                document.getElementById('summaryOverdue').innerHTML = '₹ ' + overdueAmount.toFixed(2);
-            }
-            
-            document.getElementById('summaryCharge').innerHTML = '₹ ' + chargeAmount.toFixed(2);
-            document.getElementById('summaryTotal').innerHTML = '₹ ' + totalAmount.toFixed(2);
-            
-            // Update remaining interest
-            const remainingInterest = pendingInterest - interestAmount;
-            document.getElementById('remainingInterestAfter').innerHTML = '₹ ' + (remainingInterest > 0 ? remainingInterest.toFixed(2) : '0.00');
         }
 
-        // Confirm collection function with detailed breakdown
         function confirmCollect() {
             const interestAmount = parseFloat(document.getElementById('interest_amount').value) || 0;
             const overdueAmount = parseFloat(document.getElementById('overdue_amount')?.value || 0);
@@ -3278,20 +3201,12 @@ if (!$company) {
             const totalAmount = interestAmount + overdueAmount + chargeAmount;
             
             let message = 'Collect payment of ₹' + totalAmount.toFixed(2) + '?\n\n';
-            message += '═══════════════════════════\n';
             message += 'BREAKDOWN:\n';
-            message += '═══════════════════════════\n';
-            message += '• Current Interest: ₹' + interestAmount.toFixed(2) + '\n';
-            if (overdueAmount > 0) {
-                message += '• Overdue Amount: ₹' + overdueAmount.toFixed(2) + '\n';
-            }
-            if (chargeAmount > 0) {
-                message += '• Overdue Charge: ₹' + chargeAmount.toFixed(2) + '\n';
-            }
-            message += '───────────────────────────\n';
-            message += '• TOTAL: ₹' + totalAmount.toFixed(2) + '\n';
-            message += '═══════════════════════════\n';
-            message += 'Remaining Interest after payment: ₹' + (pendingInterest - interestAmount).toFixed(2);
+            message += '• Interest: ₹' + interestAmount.toFixed(2) + '\n';
+            if (overdueAmount > 0) message += '• Overdue: ₹' + overdueAmount.toFixed(2) + '\n';
+            if (chargeAmount > 0) message += '• Charge: ₹' + chargeAmount.toFixed(2) + '\n';
+            message += '───────────\n';
+            message += 'TOTAL: ₹' + totalAmount.toFixed(2);
             
             return confirm(message);
         }
@@ -3299,7 +3214,6 @@ if (!$company) {
         // Principal Modal Functions
         function showPrincipalModal() {
             document.getElementById('principalModal').classList.add('active');
-            // Reset bank selection
             document.getElementById('principal_payment_mode').value = 'cash';
             document.getElementById('principal_bank_selection').classList.remove('show');
         }
@@ -3323,13 +3237,11 @@ if (!$company) {
         window.onclick = function(event) {
             const interestModal = document.getElementById('interestModal');
             const principalModal = document.getElementById('principalModal');
+            const monthlyModal = document.getElementById('monthlyInterestModal');
             
-            if (event.target == interestModal) {
-                hideInterestModal();
-            }
-            if (event.target == principalModal) {
-                hidePrincipalModal();
-            }
+            if (event.target == interestModal) hideInterestModal();
+            if (event.target == principalModal) hidePrincipalModal();
+            if (event.target == monthlyModal) hideMonthlyInterestModal();
         }
 
         // Auto-hide alerts after 5 seconds

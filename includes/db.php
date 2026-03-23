@@ -1,5 +1,5 @@
 <?php
-$db_host = 'localhost';
+$db_host = 'srv1752.hstgr.io';
 $db_name = 'u983225556_pawngold';
 $db_user = 'u983225556_pawngold';
 $db_pass = 'Pawngold@29';

@@ -4,8 +4,9 @@ $currentPage = 'close-loan';
 $pageTitle = 'Close Loan';
 require_once 'includes/db.php';
 require_once 'auth_check.php';
+require_once 'includes/email_helper.php';
 
-// Check if user has permission (admin or sale)
+// Check if user has permission (admin or sale, accountant)
 if (!in_array($_SESSION['user_role'], ['admin', 'sale', 'accountant'])) {
     header('Location: index.php');
     exit();
@@ -16,6 +17,110 @@ $error = '';
 $loan = null;
 $customer = null;
 $loan_id = 0;
+$receiving_person = null;
+
+// Get receiving persons (employees who can receive jewelry)
+$receiving_persons_query = "SELECT id, name, role FROM users WHERE status = 'active' AND (role = 'admin' OR role = 'sale' OR role = 'manager' OR role = 'accountant') ORDER BY name";
+$receiving_persons_result = mysqli_query($conn, $receiving_persons_query);
+
+// Get employees for dropdown
+$employees_query = "SELECT id, name FROM users WHERE status = 'active' ORDER BY name";
+$employees_result = mysqli_query($conn, $employees_query);
+
+// Check if the remaining_principal column exists
+$check_columns_query = "SHOW COLUMNS FROM loans LIKE 'remaining_principal'";
+$check_columns_result = mysqli_query($conn, $check_columns_query);
+$has_remaining_column = (mysqli_num_rows($check_columns_result) > 0);
+
+// Handle AJAX search request for live search
+if (isset($_GET['ajax_search']) && isset($_GET['term'])) {
+    header('Content-Type: application/json');
+    $search_term = mysqli_real_escape_string($conn, $_GET['term']);
+    $search_term_like = '%' . $search_term . '%';
+    
+    // Check open loans count first
+    $count_query = "SELECT COUNT(*) as count FROM loans WHERE status = 'open'";
+    $count_result = mysqli_query($conn, $count_query);
+    $open_loans_count = mysqli_fetch_assoc($count_result)['count'];
+    
+    // Use the same query structure as loan-collection.php
+    if ($has_remaining_column) {
+        $ajax_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
+                       COALESCE(l.remaining_principal, l.loan_amount) as remaining_principal,
+                       COALESCE(l.pending_interest, 0) as pending_interest,
+                       l.interest_amount,
+                       l.receipt_date, 
+                       COALESCE(l.total_overdue_amount, 0) as total_overdue_amount,
+                       c.customer_name, c.mobile_number, c.email
+                       FROM loans l
+                       JOIN customers c ON l.customer_id = c.id
+                       WHERE l.status = 'open' 
+                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       ORDER BY l.receipt_date DESC
+                       LIMIT 50";
+    } else {
+        $ajax_query = "SELECT l.id, l.receipt_number, l.loan_amount, 
+                       l.loan_amount as remaining_principal,
+                       0 as pending_interest,
+                       l.interest_amount,
+                       l.receipt_date, 
+                       0 as total_overdue_amount,
+                       c.customer_name, c.mobile_number, c.email
+                       FROM loans l
+                       JOIN customers c ON l.customer_id = c.id
+                       WHERE l.status = 'open' 
+                       AND (l.receipt_number LIKE ? OR c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                       ORDER BY l.receipt_date DESC
+                       LIMIT 50";
+    }
+    
+    $stmt = mysqli_prepare($conn, $ajax_query);
+    if ($stmt) {
+        mysqli_stmt_bind_param($stmt, 'sss', $search_term_like, $search_term_like, $search_term_like);
+        mysqli_stmt_execute($stmt);
+        $result = mysqli_stmt_get_result($stmt);
+        
+        $loans = [];
+        while ($row = mysqli_fetch_assoc($result)) {
+            // Determine match type
+            $match_type = 'partial';
+            if (stripos($row['receipt_number'], $search_term) === 0) {
+                $match_type = 'receipt_start';
+            } elseif (stripos($row['customer_name'], $search_term) === 0) {
+                $match_type = 'name_start';
+            } elseif ($row['receipt_number'] == $search_term) {
+                $match_type = 'exact';
+            }
+            
+            $loans[] = [
+                'id' => $row['id'],
+                'receipt_number' => $row['receipt_number'],
+                'customer_name' => $row['customer_name'],
+                'mobile' => $row['mobile_number'],
+                'loan_amount' => round(floatval($row['loan_amount']), 2),
+                'remaining_principal' => round(floatval($row['remaining_principal']), 2),
+                'pending_interest' => round(floatval($row['pending_interest']), 2),
+                'interest_rate' => $row['interest_amount'],
+                'overdue_amount' => round(floatval($row['total_overdue_amount']), 2),
+                'match_type' => $match_type
+            ];
+        }
+        
+        echo json_encode([
+            'results' => $loans, 
+            'count' => count($loans), 
+            'search_term' => $search_term,
+            'open_loans_count' => $open_loans_count
+        ]);
+    } else {
+        echo json_encode([
+            'error' => 'Database error: ' . mysqli_error($conn), 
+            'results' => [],
+            'open_loans_count' => $open_loans_count
+        ]);
+    }
+    exit();
+}
 
 // Get loan ID from URL
 if (isset($_GET['id'])) {
@@ -25,26 +130,38 @@ if (isset($_GET['id'])) {
 }
 
 // Handle receipt search
-$receipt_search = isset($_GET['receipt']) ? mysqli_real_escape_string($conn, $_GET['receipt']) : '';
+$search_term = isset($_GET['search']) ? mysqli_real_escape_string($conn, $_GET['search']) : '';
 
 // If receipt number is provided, search for loan
-if (!empty($receipt_search) && $loan_id == 0) {
+if (!empty($search_term) && $loan_id == 0) {
     $search_query = "SELECT id FROM loans WHERE receipt_number = ? AND status = 'open'";
     $stmt = mysqli_prepare($conn, $search_query);
-    mysqli_stmt_bind_param($stmt, 's', $receipt_search);
+    mysqli_stmt_bind_param($stmt, 's', $search_term);
     mysqli_stmt_execute($stmt);
     $search_result = mysqli_stmt_get_result($stmt);
     
     if ($row = mysqli_fetch_assoc($search_result)) {
         $loan_id = $row['id'];
     } else {
-        $error = "No open loan found with Receipt Number: " . htmlspecialchars($receipt_search);
+        // Try searching by customer name or mobile
+        $search_like = '%' . $search_term . '%';
+        $search_query = "SELECT l.id FROM loans l 
+                         JOIN customers c ON l.customer_id = c.id 
+                         WHERE l.status = 'open' 
+                         AND (c.customer_name LIKE ? OR c.mobile_number LIKE ?)
+                         LIMIT 1";
+        $stmt = mysqli_prepare($conn, $search_query);
+        mysqli_stmt_bind_param($stmt, 'ss', $search_like, $search_like);
+        mysqli_stmt_execute($stmt);
+        $search_result = mysqli_stmt_get_result($stmt);
+        
+        if ($row = mysqli_fetch_assoc($search_result)) {
+            $loan_id = $row['id'];
+        } else {
+            $error = "No open loan found matching: " . htmlspecialchars($search_term);
+        }
     }
 }
-
-// Get employees for dropdown
-$employees_query = "SELECT id, name FROM users WHERE status = 'active' ORDER BY name";
-$employees_result = mysqli_query($conn, $employees_query);
 
 // If loan ID is provided, get loan details
 if ($loan_id > 0) {
@@ -114,12 +231,7 @@ if ($loan_id > 0) {
         // ===== AUTO CALCULATIONS =====
         $principal = floatval($loan['loan_amount']);
         $interest_rate = floatval($loan['interest_amount']);
-        $total_days = $loan['total_days'];
-        
-        // Calculate months and days
-        $total_months = floor($total_days / 30);
-        $balance_days = $total_days % 30;
-        $balance_months = $total_months;
+        $total_days = max(1, $loan['total_days']);
         
         // Get total payments made
         $total_paid_query = "SELECT SUM(principal_amount) as total_principal, 
@@ -135,25 +247,30 @@ if ($loan_id > 0) {
         $paid_interest = floatval($paid_total['total_interest'] ?? 0);
         $payment_count = intval($paid_total['payment_count'] ?? 0);
         
-        // Calculate advance payments (if any)
-        $advance_principal = $paid_principal;
-        $advance_interest = $paid_interest;
-        
         // Calculate remaining principal
         $remaining_principal = $principal - $paid_principal;
         
-        // Calculate monthly interest (based on original principal)
-        $monthly_interest = ($principal * $interest_rate) / 100;
-        $daily_interest = $monthly_interest / 30;
+        // Calculate interest based on interest type
+        $interest_type = $loan['interest_type'] ?? 'monthly';
+        if ($interest_type == 'daily') {
+            $daily_interest = ($principal * $interest_rate) / 100 / 30;
+            $total_interest_accrued = $total_days * $daily_interest;
+        } else {
+            $monthly_interest = ($principal * $interest_rate) / 100;
+            $daily_interest = $monthly_interest / 30;
+            $total_interest_accrued = $total_days * $daily_interest;
+        }
         
-        // Calculate total interest accrued
-        $total_interest_accrued = $total_days * $daily_interest;
-        
-        // Calculate payable interest (total accrued minus paid)
+        // Calculate payable interest
         $payable_interest = $total_interest_accrued - $paid_interest;
+        if ($payable_interest < 0) $payable_interest = 0;
         
         // Calculate 1 month interest
-        $one_month_interest = $monthly_interest;
+        if ($interest_type == 'daily') {
+            $one_month_interest = ($principal * $interest_rate) / 100;
+        } else {
+            $one_month_interest = ($principal * $interest_rate) / 100;
+        }
         
         // Total interest due
         $total_interest_due = $payable_interest;
@@ -161,15 +278,13 @@ if ($loan_id > 0) {
         // Round all values
         $principal = round($principal, 2);
         $remaining_principal = round($remaining_principal, 2);
-        $monthly_interest = round($monthly_interest, 2);
+        $one_month_interest = round($one_month_interest, 2);
         $daily_interest = round($daily_interest, 2);
         $total_interest_accrued = round($total_interest_accrued, 2);
         $paid_interest = round($paid_interest, 2);
         $payable_interest = round($payable_interest, 2);
         $total_interest_due = round($total_interest_due, 2);
-        $one_month_interest = round($one_month_interest, 2);
-        $advance_principal = round($advance_principal, 2);
-        $advance_interest = round($advance_interest, 2);
+        $paid_principal = round($paid_principal, 2);
         
         // Calculate total payable including receipt charge
         $receipt_charge = floatval($loan['receipt_charge'] ?? 0);
@@ -193,17 +308,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $remarks = mysqli_real_escape_string($conn, $_POST['remarks'] ?? 'Advance payment');
         
         if ($advance_principal > 0 || $advance_interest > 0) {
-            // Begin transaction
             mysqli_begin_transaction($conn);
             
             try {
-                // Generate payment receipt number
                 $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
                 $receipt_result = mysqli_query($conn, $receipt_query);
                 $receipt_count = mysqli_fetch_assoc($receipt_result)['count'] + 1;
                 $payment_receipt = 'ADV' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
                 
-                // Insert advance payment
                 $insert_payment = "INSERT INTO payments (
                     loan_id, receipt_number, payment_date, principal_amount, 
                     interest_amount, total_amount, payment_mode, employee_id, remarks
@@ -225,7 +337,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 mysqli_commit($conn);
                 $message = "Advance payment of ₹" . number_format($total_amount, 2) . " added successfully!";
                 
-                // Refresh the page to show updated calculations
                 header('Location: close-loan.php?id=' . $loan_id . '&success=advance_added');
                 exit();
                 
@@ -249,74 +360,159 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $d_namuna = isset($_POST['d_namuna']) ? 1 : 0;
         $others = isset($_POST['others']) ? 1 : 0;
         
+        // Jewelry collection person details
+        $collection_type = mysqli_real_escape_string($conn, $_POST['collection_type'] ?? 'customer');
+        $receiving_person_name = '';
+        $receiving_person_relation = '';
+        $receiving_person_mobile = '';
+        $receiving_person_id_proof = '';
+        $receiving_person_signature = isset($_POST['signature_verified']) ? 1 : 0;
+        $id_proof_verified = isset($_POST['id_proof_verified']) ? 1 : 0;
+        
+        if ($collection_type === 'customer') {
+            $receiving_person_name = $customer['name'];
+            $receiving_person_relation = 'Self';
+            $receiving_person_mobile = $customer['mobile'];
+            $receiving_person_id_proof = $customer['aadhaar'] ?? '';
+        } else {
+            $receiving_person_name = mysqli_real_escape_string($conn, $_POST['other_person_name'] ?? '');
+            $receiving_person_relation = mysqli_real_escape_string($conn, $_POST['other_person_relation'] ?? '');
+            $receiving_person_mobile = mysqli_real_escape_string($conn, $_POST['other_person_mobile'] ?? '');
+            $receiving_person_id_proof = mysqli_real_escape_string($conn, $_POST['other_person_id_proof'] ?? '');
+            
+            if (empty($receiving_person_name)) {
+                $error = "Please enter the name of the person collecting the jewelry";
+            }
+        }
+        
         $total_amount = $final_principal + $final_interest + $receipt_charge - $discount + $round_off;
         
-        // Begin transaction
-        mysqli_begin_transaction($conn);
-        
-        try {
-            // Generate closure receipt number
-            $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
-            $receipt_result = mysqli_query($conn, $receipt_query);
-            $receipt_count = mysqli_fetch_assoc($receipt_result)['count'] + 1;
-            $payment_receipt = 'CLS' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
+        if (empty($error)) {
+            mysqli_begin_transaction($conn);
             
-            // Insert final payment if any amount is paid
-            if ($total_amount > 0) {
-                $insert_payment = "INSERT INTO payments (
-                    loan_id, receipt_number, payment_date, principal_amount, 
-                    interest_amount, total_amount, payment_mode, employee_id, remarks
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            try {
+                $receipt_query = "SELECT COUNT(*) as count FROM payments WHERE DATE(created_at) = CURDATE()";
+                $receipt_result = mysqli_query($conn, $receipt_query);
+                $receipt_count = mysqli_fetch_assoc($receipt_result)['count'] + 1;
+                $payment_receipt = 'CLS' . date('ymd') . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
                 
-                $stmt = mysqli_prepare($conn, $insert_payment);
-                mysqli_stmt_bind_param($stmt, 'issdddiss', 
-                    $loan_id, $payment_receipt, $close_date,
-                    $final_principal, $final_interest, $total_amount,
-                    $payment_mode, $employee_id, $remarks
+                // Insert final payment if any amount is paid
+                if ($total_amount > 0) {
+                    $insert_payment = "INSERT INTO payments (
+                        loan_id, receipt_number, payment_date, principal_amount, 
+                        interest_amount, total_amount, payment_mode, employee_id, remarks
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    
+                    $stmt = mysqli_prepare($conn, $insert_payment);
+                    mysqli_stmt_bind_param($stmt, 'issdddiss', 
+                        $loan_id, $payment_receipt, $close_date,
+                        $final_principal, $final_interest, $total_amount,
+                        $payment_mode, $employee_id, $remarks
+                    );
+                    
+                    if (!mysqli_stmt_execute($stmt)) {
+                        throw new Exception("Error adding final payment: " . mysqli_stmt_error($stmt));
+                    }
+                }
+                
+                // Insert jewelry return record
+                $insert_return = "INSERT INTO jewelry_returns (
+                    loan_id, loan_receipt_number, customer_id, customer_name,
+                    return_date, collection_type, receiving_person_name, receiving_person_relation,
+                    receiving_person_mobile, receiving_person_id_proof, signature_verified, 
+                    id_proof_verified, remarks, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                
+                $stmt = mysqli_prepare($conn, $insert_return);
+                mysqli_stmt_bind_param($stmt, 'isississssissi', 
+                    $loan_id, $loan['receipt_number'], $customer['id'], $customer['name'],
+                    $close_date, $collection_type, $receiving_person_name, $receiving_person_relation,
+                    $receiving_person_mobile, $receiving_person_id_proof, $receiving_person_signature, 
+                    $id_proof_verified, $remarks, $employee_id
                 );
                 
                 if (!mysqli_stmt_execute($stmt)) {
-                    throw new Exception("Error adding final payment: " . mysqli_stmt_error($stmt));
+                    throw new Exception("Error recording jewelry return: " . mysqli_stmt_error($stmt));
                 }
+                
+                $return_id = mysqli_insert_id($conn);
+                
+                // Insert jewelry items return details
+                foreach ($items as $item) {
+                    $insert_item_return = "INSERT INTO jewelry_return_items (
+                        return_id, loan_id, item_id, jewel_name, karat, 
+                        net_weight, quantity, defect_details, stone_details
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                    
+                    $stmt = mysqli_prepare($conn, $insert_item_return);
+                    mysqli_stmt_bind_param($stmt, 'iiissdiss', 
+                        $return_id, $loan_id, $item['id'], $item['jewel_name'], $item['karat'],
+                        $item['net_weight'], $item['quantity'], $item['defect_details'], $item['stone_details']
+                    );
+                    
+                    if (!mysqli_stmt_execute($stmt)) {
+                        throw new Exception("Error recording jewelry item return: " . mysqli_stmt_error($stmt));
+                    }
+                }
+                
+                // Update loan as closed
+                $update_loan = "UPDATE loans SET 
+                    status = 'closed', 
+                    close_date = ?,
+                    discount = ?,
+                    round_off = ?,
+                    d_namuna = ?,
+                    others = ?,
+                    updated_at = NOW()
+                    WHERE id = ?";
+                
+                $stmt = mysqli_prepare($conn, $update_loan);
+                mysqli_stmt_bind_param($stmt, 'sddiii', 
+                    $close_date, $discount, $round_off, $d_namuna, $others, $loan_id
+                );
+                
+                if (!mysqli_stmt_execute($stmt)) {
+                    throw new Exception("Error closing loan: " . mysqli_stmt_error($stmt));
+                }
+                
+                // Log activity
+                $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
+                              VALUES (?, 'close', ?, 'loans', ?)";
+                $log_stmt = mysqli_prepare($conn, $log_query);
+                $log_description = "Loan closed with final payment of ₹" . number_format($total_amount, 2) . ". Jewelry collected by: " . 
+                                   ($collection_type == 'customer' ? "Customer: " . $customer['name'] : 
+                                    "Other Person: " . $receiving_person_name . " (Relation: " . $receiving_person_relation . ")");
+                mysqli_stmt_bind_param($log_stmt, 'isi', $_SESSION['user_id'], $log_description, $loan_id);
+                mysqli_stmt_execute($log_stmt);
+                
+                mysqli_commit($conn);
+                
+                // Send email notification if customer has email
+                if (!empty($customer['email'])) {
+                    $email_details = [
+                        'customer_name' => $customer['name'],
+                        'customer_email' => $customer['email'],
+                        'loan_receipt' => $loan['receipt_number'],
+                        'close_date' => $close_date,
+                        'remaining_principal' => $remaining_principal,
+                        'interest_paid' => $payable_interest,
+                        'total_paid' => $total_amount,
+                        'collection_type' => $collection_type,
+                        'collection_person' => $receiving_person_name,
+                        'items_count' => count($items),
+                        'items' => $items
+                    ];
+                    sendLoanClosureConfirmationEmail($email_details, $conn);
+                }
+                
+                // Redirect to print closure receipt
+                header('Location: print-close-receipt.php?id=' . $loan_id);
+                exit();
+                
+            } catch (Exception $e) {
+                mysqli_rollback($conn);
+                $error = "Error closing loan: " . $e->getMessage();
             }
-            
-            // Update loan as closed
-            $update_loan = "UPDATE loans SET 
-                status = 'closed', 
-                close_date = ?,
-                discount = ?,
-                round_off = ?,
-                d_namuna = ?,
-                others = ?,
-                updated_at = NOW()
-                WHERE id = ?";
-            
-            $stmt = mysqli_prepare($conn, $update_loan);
-            mysqli_stmt_bind_param($stmt, 'sddiii', 
-                $close_date, $discount, $round_off, $d_namuna, $others, $loan_id
-            );
-            
-            if (!mysqli_stmt_execute($stmt)) {
-                throw new Exception("Error closing loan: " . mysqli_stmt_error($stmt));
-            }
-            
-            // Log activity
-            $log_query = "INSERT INTO activity_log (user_id, action, description, table_name, record_id) 
-                          VALUES (?, 'close', ?, 'loans', ?)";
-            $log_stmt = mysqli_prepare($conn, $log_query);
-            $log_description = "Loan closed with final payment of ₹" . number_format($total_amount, 2);
-            mysqli_stmt_bind_param($log_stmt, 'isi', $_SESSION['user_id'], $log_description, $loan_id);
-            mysqli_stmt_execute($log_stmt);
-            
-            mysqli_commit($conn);
-            
-            // Redirect to print closure receipt
-            header('Location: print-close-receipt.php?id=' . $loan_id);
-            exit();
-            
-        } catch (Exception $e) {
-            mysqli_rollback($conn);
-            $error = "Error closing loan: " . $e->getMessage();
         }
     }
 }
@@ -329,6 +525,15 @@ if (isset($_GET['success'])) {
             break;
     }
 }
+
+// Get total open loans for stats
+$open_loans_count_query = "SELECT COUNT(*) as count FROM loans WHERE status = 'open'";
+$open_count_result = mysqli_query($conn, $open_loans_count_query);
+$open_count = mysqli_fetch_assoc($open_count_result)['count'];
+
+$total_principal_query = "SELECT SUM(loan_amount) as total FROM loans WHERE status = 'open'";
+$total_result = mysqli_query($conn, $total_principal_query);
+$total_data = mysqli_fetch_assoc($total_result);
 ?>
 
 <!DOCTYPE html>
@@ -346,7 +551,7 @@ if (isset($_GET['success'])) {
         }
 
         body {
-            font-family: 'Poppins', 'Pyidaungsu', sans-serif;
+            font-family: 'Poppins', sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         }
 
@@ -420,33 +625,6 @@ if (isset($_GET['success'])) {
             background: #38a169;
         }
 
-        .btn-warning {
-            background: #ecc94b;
-            color: white;
-        }
-
-        .btn-warning:hover {
-            background: #d69e2e;
-        }
-
-        .btn-danger {
-            background: #f56565;
-            color: white;
-        }
-
-        .btn-danger:hover {
-            background: #c53030;
-        }
-
-        .btn-info {
-            background: #4299e1;
-            color: white;
-        }
-
-        .btn-info:hover {
-            background: #3182ce;
-        }
-
         .btn-secondary {
             background: #a0aec0;
             color: white;
@@ -492,66 +670,159 @@ if (isset($_GET['success'])) {
             gap: 10px;
         }
 
-        .search-box {
-            display: flex;
-            gap: 15px;
-            align-items: flex-end;
+        .search-title i {
+            color: #667eea;
         }
 
-        .search-box .form-group {
-            flex: 1;
-            margin-bottom: 0;
+        .live-search-container {
+            position: relative;
+            margin-bottom: 20px;
         }
 
-        .form-group {
-            margin-bottom: 15px;
+        .live-search-input {
+            width: 100%;
+            padding: 15px 20px 15px 50px;
+            border: 2px solid #e2e8f0;
+            border-radius: 12px;
+            font-size: 16px;
+            transition: all 0.3s;
+            background: #f8fafc;
         }
 
-        .form-label {
+        .live-search-input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+            background: white;
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #a0aec0;
+            font-size: 20px;
+        }
+
+        .clear-search {
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #a0aec0;
+            cursor: pointer;
+            font-size: 20px;
+            display: none;
+        }
+
+        .clear-search:hover {
+            color: #f56565;
+        }
+
+        .search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border: 2px solid #667eea;
+            border-radius: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+            margin-top: 5px;
+        }
+
+        .search-results.show {
             display: block;
-            font-size: 14px;
+        }
+
+        .search-result-item {
+            padding: 15px;
+            border-bottom: 1px solid #e2e8f0;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .search-result-item:hover {
+            background: #ebf4ff;
+        }
+
+        .match-badge {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 20px;
+            background: #667eea20;
+            color: #667eea;
             font-weight: 600;
-            color: #4a5568;
+        }
+
+        .match-badge.exact {
+            background: #48bb7820;
+            color: #276749;
+        }
+
+        .result-receipt {
+            font-weight: 700;
+            color: #667eea;
+            font-size: 16px;
             margin-bottom: 5px;
         }
 
-        .required::after {
-            content: "*";
-            color: #f56565;
-            margin-left: 4px;
+        .result-customer {
+            font-weight: 600;
+            color: #2d3748;
+            font-size: 15px;
+            margin-bottom: 3px;
         }
 
-        .input-group {
-            position: relative;
+        .result-details {
             display: flex;
+            gap: 20px;
+            font-size: 13px;
+            color: #718096;
+            flex-wrap: wrap;
+            margin-top: 5px;
+        }
+
+        .result-mobile {
+            color: #48bb78;
+        }
+
+        .result-balance {
+            color: #4299e1;
+            font-weight: 600;
+        }
+
+        .result-overdue {
+            color: #f56565;
+            font-weight: 600;
+        }
+
+        .search-stats {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #718096;
+            display: flex;
+            justify-content: space-between;
             align-items: center;
         }
 
-        .input-icon {
-            position: absolute;
-            left: 12px;
-            color: #a0aec0;
-            z-index: 1;
-        }
-
-        .form-control, .form-select {
-            width: 100%;
-            padding: 10px 12px 10px 40px;
-            border: 1px solid #e2e8f0;
-            border-radius: 8px;
-            font-size: 14px;
-            transition: all 0.3s;
-        }
-
-        .form-control:focus, .form-select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-        }
-
-        .readonly-field {
+        .quick-stats {
+            display: flex;
+            gap: 20px;
+            margin-top: 20px;
+            padding: 15px;
             background: #f7fafc;
-            cursor: not-allowed;
+            border-radius: 8px;
+            flex-wrap: wrap;
         }
 
         .info-card {
@@ -574,35 +845,25 @@ if (isset($_GET['success'])) {
             gap: 10px;
         }
 
-        /* Main Content Layout */
-        .main-content-grid {
+        .section-title i {
+            color: #667eea;
+        }
+
+        .three-column-layout {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: repeat(3, 1fr);
             gap: 20px;
             margin-bottom: 20px;
         }
 
-        .left-panel {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        .right-panel {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        /* Loan Info Cards */
-        .loan-info-card {
+        .column {
             background: white;
             border-radius: 12px;
             padding: 20px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
 
-        .loan-info-title {
+        .column-title {
             font-size: 16px;
             font-weight: 600;
             color: #2d3748;
@@ -646,106 +907,6 @@ if (isset($_GET['success'])) {
             font-size: 16px;
         }
 
-        .info-value.warning {
-            color: #f56565;
-        }
-
-        /* Three Column Layout for Top Section */
-        .three-column-layout {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-
-        .column {
-            background: white;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-
-        .column-title {
-            font-size: 16px;
-            font-weight: 600;
-            color: #2d3748;
-            margin-bottom: 15px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #e2e8f0;
-        }
-
-        /* Customer Info Box */
-        .customer-box {
-            background: linear-gradient(135deg, #667eea10 0%, #764ba210 100%);
-            border: 1px solid #667eea30;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-
-        .customer-name {
-            font-size: 18px;
-            font-weight: 700;
-            color: #2d3748;
-            margin-bottom: 10px;
-        }
-
-        .customer-detail {
-            display: flex;
-            margin-bottom: 8px;
-            font-size: 14px;
-        }
-
-        .customer-detail-label {
-            width: 100px;
-            color: #4a5568;
-        }
-
-        .customer-detail-value {
-            font-weight: 600;
-            color: #2d3748;
-        }
-
-        /* Options Row */
-        .options-row {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            margin: 15px 0;
-            flex-wrap: wrap;
-        }
-
-        .option-item {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-        }
-
-        .option-item input[type="checkbox"] {
-            width: 16px;
-            height: 16px;
-            accent-color: #667eea;
-        }
-
-        .payment-methods {
-            display: flex;
-            gap: 20px;
-            margin-left: auto;
-        }
-
-        .payment-method {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            font-size: 14px;
-            color: #4a5568;
-        }
-
-        .payment-method i {
-            color: #48bb78;
-        }
-
-        /* Calculations Row */
         .calculations-row {
             display: grid;
             grid-template-columns: repeat(4, 1fr);
@@ -779,7 +940,10 @@ if (isset($_GET['success'])) {
             color: #ecc94b;
         }
 
-        /* Items Table */
+        .calc-value.total {
+            color: #48bb78;
+        }
+
         .items-table {
             width: 100%;
             border-collapse: collapse;
@@ -807,12 +971,6 @@ if (isset($_GET['success'])) {
             font-weight: 600;
         }
 
-        .items-table tfoot td {
-            padding: 12px;
-            border-top: 2px solid #e2e8f0;
-        }
-
-        /* Total Quantity Box */
         .total-quantity-box {
             background: linear-gradient(135deg, #48bb7810 0%, #38a16910 100%);
             border: 1px solid #48bb78;
@@ -822,7 +980,6 @@ if (isset($_GET['success'])) {
             margin-top: 10px;
         }
 
-        /* Action Buttons */
         .action-buttons {
             display: flex;
             gap: 15px;
@@ -849,20 +1006,10 @@ if (isset($_GET['success'])) {
             box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
         }
 
-        .action-btn.pay-advance:hover {
-            background: #5a67d8;
-            transform: translateY(-2px);
-        }
-
         .action-btn.close-loan {
             background: #48bb78;
             color: white;
             box-shadow: 0 4px 15px rgba(72, 187, 120, 0.4);
-        }
-
-        .action-btn.close-loan:hover {
-            background: #38a169;
-            transform: translateY(-2px);
         }
 
         .action-btn.receipt {
@@ -871,12 +1018,6 @@ if (isset($_GET['success'])) {
             box-shadow: 0 4px 15px rgba(236, 201, 75, 0.4);
         }
 
-        .action-btn.receipt:hover {
-            background: #d69e2e;
-            transform: translateY(-2px);
-        }
-
-        /* Modal Styles */
         .modal {
             display: none;
             position: fixed;
@@ -898,7 +1039,7 @@ if (isset($_GET['success'])) {
             background: white;
             border-radius: 12px;
             padding: 30px;
-            max-width: 500px;
+            max-width: 700px;
             width: 90%;
             max-height: 90vh;
             overflow-y: auto;
@@ -922,12 +1063,150 @@ if (isset($_GET['success'])) {
             color: #f56565;
         }
 
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #4a5568;
+            font-size: 14px;
+        }
+
+        .form-label.required:after {
+            content: "*";
+            color: #f56565;
+            margin-left: 4px;
+        }
+
+        .form-control, .form-select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+
+        .form-control:focus, .form-select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+        }
+
+        .options-row {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+
+        .option-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .option-item input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        .summary-box {
+            background: #f7fafc;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+        }
+
+        .collection-person-section {
+            background: #ebf8ff;
+            border-left: 4px solid #4299e1;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+
+        .collection-person-title {
+            font-weight: 600;
+            color: #2c5282;
+            margin-bottom: 15px;
+            font-size: 16px;
+        }
+
+        .collection-type-buttons {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .collection-type-btn {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            text-align: center;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .collection-type-btn.active {
+            background: #4299e1;
+            border-color: #4299e1;
+            color: white;
+        }
+
+        .collection-type-btn:hover:not(.active) {
+            border-color: #4299e1;
+        }
+
+        .other-person-fields {
+            display: none;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #cbd5e0;
+        }
+
+        .other-person-fields.show {
+            display: block;
+        }
+
+        .loading-indicator {
+            text-align: center;
+            padding: 20px;
+            color: #667eea;
+        }
+
+        .no-results {
+            text-align: center;
+            padding: 40px;
+            color: #a0aec0;
+        }
+
+        .no-results i {
+            font-size: 48px;
+            margin-bottom: 10px;
+            display: block;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .spin {
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+
         @media (max-width: 1200px) {
             .three-column-layout {
-                grid-template-columns: 1fr;
-            }
-            
-            .main-content-grid {
                 grid-template-columns: 1fr;
             }
             
@@ -937,9 +1216,8 @@ if (isset($_GET['success'])) {
         }
 
         @media (max-width: 768px) {
-            .search-box {
-                flex-direction: column;
-                align-items: stretch;
+            .calculations-row {
+                grid-template-columns: 1fr;
             }
             
             .action-buttons {
@@ -954,19 +1232,6 @@ if (isset($_GET['success'])) {
             .options-row {
                 flex-direction: column;
                 align-items: flex-start;
-            }
-            
-            .payment-methods {
-                margin-left: 0;
-            }
-            
-            .calculations-row {
-                grid-template-columns: 1fr;
-            }
-            
-            .items-table {
-                overflow-x: auto;
-                display: block;
             }
         }
     </style>
@@ -1002,7 +1267,7 @@ if (isset($_GET['success'])) {
                         <div class="alert alert-error"><?php echo $error; ?></div>
                     <?php endif; ?>
 
-                    <!-- Search Section - Show if no loan selected -->
+                    <!-- Live Search Section - Show if no loan selected -->
                     <?php if (!$loan && $loan_id == 0): ?>
                     <div class="search-card">
                         <div class="search-title">
@@ -1010,18 +1275,26 @@ if (isset($_GET['success'])) {
                             Find Loan to Close
                         </div>
 
-                        <form method="GET" action="" class="search-box">
-                            <div class="form-group">
-                                <label class="form-label required">Receipt Number</label>
-                                <div class="input-group">
-                                    <i class="bi bi-receipt input-icon"></i>
-                                    <input type="text" class="form-control" name="receipt" value="<?php echo htmlspecialchars($receipt_search); ?>" placeholder="Enter Receipt Number" required>
-                                </div>
-                            </div>
-                            <button type="submit" class="btn btn-primary">
-                                <i class="bi bi-search"></i> Search
-                            </button>
-                        </form>
+                        <div class="live-search-container">
+                            <i class="bi bi-search search-icon"></i>
+                            <input type="text" class="live-search-input" id="liveSearch" 
+                                   placeholder="Type receipt number, customer name or mobile number..." 
+                                   value="<?php echo isset($_GET['search']) ? htmlspecialchars($_GET['search']) : ''; ?>"
+                                   autocomplete="off">
+                            <i class="bi bi-x-circle clear-search" id="clearSearch" onclick="clearSearch()"></i>
+                            
+                            <div class="search-results" id="searchResults"></div>
+                        </div>
+
+                        <div class="search-stats">
+                            <span id="searchStats">Type at least 2 characters to search</span>
+                            <span id="resultCount"></span>
+                        </div>
+
+                        <div class="quick-stats">
+                            <div><strong>Total Open Loans:</strong> <?php echo $open_count; ?></div>
+                            <div><strong>Total Outstanding:</strong> ₹ <?php echo number_format($total_data['total'] ?? 0, 0); ?></div>
+                        </div>
                     </div>
                     <?php endif; ?>
 
@@ -1048,13 +1321,13 @@ if (isset($_GET['success'])) {
                                 </div>
                                 
                                 <div class="info-row">
-                                    <span class="info-label">Product Type</span>
-                                    <span class="info-value"><?php echo $loan['product_type'] ?? 'Jewelry'; ?></span>
+                                    <span class="info-label">Interest Type</span>
+                                    <span class="info-value interest"><?php echo ucfirst($interest_type); ?></span>
                                 </div>
                                 
                                 <div class="info-row">
-                                    <span class="info-label">Interest Type</span>
-                                    <span class="info-value"><?php echo $loan['interest_type']; ?></span>
+                                    <span class="info-label">Interest Rate</span>
+                                    <span class="info-value interest"><?php echo $interest_rate; ?>%</span>
                                 </div>
                                 
                                 <div class="info-row">
@@ -1099,11 +1372,11 @@ if (isset($_GET['success'])) {
                                 
                                 <div class="info-row">
                                     <span class="info-label">Receipt Charge</span>
-                                    <span class="info-value">₹ <?php echo number_format($loan['receipt_charge'], 2); ?></span>
+                                    <span class="info-value">₹ <?php echo number_format($loan['receipt_charge'] ?? 0, 2); ?></span>
                                 </div>
                             </div>
 
-                            <!-- Column 3: Customer Info & Options -->
+                            <!-- Column 3: Customer Info -->
                             <div class="column">
                                 <div class="column-title">Customer Information</div>
                                 
@@ -1123,28 +1396,13 @@ if (isset($_GET['success'])) {
                                 </div>
                                 
                                 <div class="info-row">
+                                    <span class="info-label">Email</span>
+                                    <span class="info-value"><?php echo htmlspecialchars($customer['email'] ?: 'N/A'); ?></span>
+                                </div>
+                                
+                                <div class="info-row">
                                     <span class="info-label">Address</span>
-                                    <span class="info-value"><?php echo htmlspecialchars(substr($customer['address'], 0, 30)) . '...'; ?></span>
-                                </div>
-                                
-                                <div class="options-row">
-                                    <div class="option-item">
-                                        <input type="checkbox" id="d_namuna" name="d_namuna">
-                                        <label for="d_namuna">D-Namuna</label>
-                                    </div>
-                                    <div class="option-item">
-                                        <input type="checkbox" id="others" name="others">
-                                        <label for="others">Others</label>
-                                    </div>
-                                </div>
-                                
-                                <div class="payment-methods">
-                                    <div class="payment-method">
-                                        <i class="bi bi-cash"></i> Cash
-                                    </div>
-                                    <div class="payment-method">
-                                        <i class="bi bi-bank"></i> Other Payments
-                                    </div>
+                                    <span class="info-value"><?php echo htmlspecialchars(substr($customer['address'], 0, 40)); ?></span>
                                 </div>
                             </div>
                         </div>
@@ -1152,28 +1410,28 @@ if (isset($_GET['success'])) {
                         <!-- Advance & Interest Row - Calculations -->
                         <div class="calculations-row">
                             <div class="calc-box">
-                                <div class="calc-label">Advance Principal</div>
-                                <div class="calc-value principal">₹ <?php echo number_format($advance_principal, 2); ?></div>
+                                <div class="calc-label">Paid Principal</div>
+                                <div class="calc-value principal">₹ <?php echo number_format($paid_principal, 2); ?></div>
                             </div>
                             <div class="calc-box">
-                                <div class="calc-label">Advance Interest</div>
-                                <div class="calc-value interest">₹ <?php echo number_format($advance_interest, 2); ?></div>
+                                <div class="calc-label">Paid Interest</div>
+                                <div class="calc-value interest">₹ <?php echo number_format($paid_interest, 2); ?></div>
                             </div>
                             <div class="calc-box">
-                                <div class="calc-label">Total Interest</div>
+                                <div class="calc-label">Total Interest Due</div>
                                 <div class="calc-value interest">₹ <?php echo number_format($total_interest_due, 2); ?></div>
-                            </div>
-                            <div class="calc-box">
-                                <div class="calc-label">Balance Months</div>
-                                <div class="calc-value"><?php echo $balance_months; ?></div>
                             </div>
                             <div class="calc-box">
                                 <div class="calc-label">Total Days</div>
                                 <div class="calc-value"><?php echo $total_days; ?></div>
                             </div>
                             <div class="calc-box">
+                                <div class="calc-label">Daily Interest</div>
+                                <div class="calc-value interest">₹ <?php echo number_format($daily_interest, 2); ?></div>
+                            </div>
+                            <div class="calc-box">
                                 <div class="calc-label">Discount</div>
-                                <div class="calc-value warning">₹ 0.00</div>
+                                <div class="calc-value">₹ 0.00</div>
                             </div>
                             <div class="calc-box">
                                 <div class="calc-label">Round Off</div>
@@ -1185,22 +1443,12 @@ if (isset($_GET['success'])) {
                             </div>
                         </div>
 
-                        <!-- Product Info -->
-                        <div class="loan-info-card">
-                            <div class="loan-info-title">Product Details</div>
-                            <div class="info-row">
-                                <span class="info-label">Product</span>
-                                <span class="info-value"><?php echo $loan['product_type'] ?? 'Jewelry'; ?></span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">Principal / Interest</span>
-                                <span class="info-value">₹ <?php echo number_format($principal, 2); ?> / <?php echo $interest_rate; ?>%</span>
-                            </div>
-                        </div>
-
                         <!-- Jewelry Items Table -->
-                        <div class="loan-info-card">
-                            <div class="loan-info-title">Jewelry Items</div>
+                        <div class="info-card">
+                            <div class="section-title">
+                                <i class="bi bi-gem"></i>
+                                Jewelry Items to Return
+                            </div>
                             
                             <table class="items-table">
                                 <thead>
@@ -1212,8 +1460,7 @@ if (isset($_GET['success'])) {
                                         <th>Karat</th>
                                         <th>Net Weight</th>
                                         <th>Quantity</th>
-                                    </tr>
-                                </thead>
+                                    </thead>
                                 <tbody>
                                     <?php 
                                     $sno = 1;
@@ -1234,169 +1481,62 @@ if (isset($_GET['success'])) {
                                 </tbody>
                                 <tfoot>
                                     <tr>
-                                        <td colspan="6" style="text-align: right;">Total Quantity:</td>
-                                        <td><?php echo $total_qty; ?></td>
-                                    </tr>
-                                    <tr>
-                                        <td colspan="6" style="text-align: right;">Total Net Weight:</td>
-                                        <td><?php echo number_format($total_net_weight, 3); ?> g</td>
+                                        <td colspan="6" style="text-align: right;"><strong>Total Quantity:</strong></td>
+                                        <td><strong><?php echo $total_qty; ?></strong></td>
                                     </tr>
                                 </tfoot>
                             </table>
                             
                             <div class="total-quantity-box">
-                                <strong>Total Weight:</strong> <?php echo number_format($total_net_weight, 3); ?> g
+                                <i class="bi bi-calculator"></i> Total Items: <?php echo count($items); ?> | Total Quantity: <?php echo $total_qty; ?> pcs
                             </div>
                         </div>
+
+                        <!-- Payment History -->
+                        <?php if (!empty($payments)): ?>
+                        <div class="info-card">
+                            <div class="section-title">
+                                <i class="bi bi-clock-history"></i>
+                                Payment History
+                            </div>
+                            
+                            <table class="items-table">
+                                <thead>
+                                    <tr>
+                                        <th>Date</th>
+                                        <th>Receipt No</th>
+                                        <th>Principal (₹)</th>
+                                        <th>Interest (₹)</th>
+                                        <th>Total (₹)</th>
+                                        <th>Mode</th>
+                                        <th>Remarks</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($payments as $payment): ?>
+                                    <tr>
+                                        <td><?php echo date('d-m-Y', strtotime($payment['payment_date'])); ?></td>
+                                        <td><strong><?php echo $payment['receipt_number']; ?></strong></td>
+                                        <td>₹ <?php echo number_format($payment['principal_amount'], 2); ?></td>
+                                        <td>₹ <?php echo number_format($payment['interest_amount'], 2); ?></td>
+                                        <td><strong>₹ <?php echo number_format($payment['total_amount'], 2); ?></strong></td>
+                                        <td><?php echo strtoupper($payment['payment_mode']); ?></td>
+                                        <td><?php echo htmlspecialchars($payment['remarks']); ?></td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                        <?php endif; ?>
 
                         <!-- Action Buttons -->
                         <div class="action-buttons">
-                            <button class="action-btn pay-advance" onclick="showAdvanceModal()">
-                                <i class="bi bi-cash-stack"></i> Pay Advance
+                            <button type="button" class="action-btn pay-advance" onclick="showAdvanceModal()">
+                                <i class="bi bi-cash"></i> Add Advance Payment
                             </button>
-                            <button class="action-btn close-loan" onclick="showCloseModal()">
+                            <button type="button" class="action-btn close-loan" onclick="showCloseModal()">
                                 <i class="bi bi-check-circle"></i> Close Loan
                             </button>
-                            <button class="action-btn receipt" onclick="window.location.href='print-receipt.php?id=<?php echo $loan_id; ?>'">
-                                <i class="bi bi-receipt"></i> Receipt
-                            </button>
-                        </div>
-
-                        <!-- Hidden form for options -->
-                        <form id="optionsForm">
-                            <input type="hidden" id="option_d_namuna" name="d_namuna" value="0">
-                            <input type="hidden" id="option_others" name="others" value="0">
-                        </form>
-
-                        <!-- Advance Payment Modal -->
-                        <div class="modal" id="advanceModal">
-                            <div class="modal-content">
-                                <span class="modal-close" onclick="hideAdvanceModal()">&times;</span>
-                                <h3 class="modal-title">Pay Advance</h3>
-                                
-                                <form method="POST" action="" id="advanceForm">
-                                    <input type="hidden" name="action" value="pay_advance">
-                                    <input type="hidden" name="loan_id" value="<?php echo $loan_id; ?>">
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">Advance Principal (₹)</label>
-                                        <input type="number" class="form-control" name="advance_principal" id="advance_principal" value="0" step="0.01" min="0" max="<?php echo $remaining_principal; ?>" onchange="calculateAdvanceTotal()">
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">Advance Interest (₹)</label>
-                                        <input type="number" class="form-control" name="advance_interest" id="advance_interest" value="0" step="0.01" min="0" max="<?php echo $payable_interest; ?>" onchange="calculateAdvanceTotal()">
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">Payment Mode</label>
-                                        <select class="form-select" name="payment_mode" required>
-                                            <option value="cash">Cash</option>
-                                            <option value="bank">Bank Transfer</option>
-                                            <option value="upi">UPI</option>
-                                        </select>
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">Remarks</label>
-                                        <textarea class="form-control" name="remarks" rows="2" placeholder="Enter remarks"></textarea>
-                                    </div>
-                                    
-                                    <div class="summary-box" style="background: #f7fafc; padding: 15px; border-radius: 8px; margin: 15px 0;">
-                                        <div class="info-row">
-                                            <span>Total Advance:</span>
-                                            <span style="font-weight: 700; color: #667eea;" id="advance_total">₹ 0.00</span>
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="action-buttons" style="margin-top: 20px;">
-                                        <button type="button" class="btn btn-secondary" onclick="hideAdvanceModal()">Cancel</button>
-                                        <button type="submit" class="btn btn-success">Pay Advance</button>
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-
-                        <!-- Close Loan Modal -->
-                        <div class="modal" id="closeModal">
-                            <div class="modal-content">
-                                <span class="modal-close" onclick="hideCloseModal()">&times;</span>
-                                <h3 class="modal-title">Close Loan</h3>
-                                
-                                <form method="POST" action="" id="closeForm">
-                                    <input type="hidden" name="action" value="close_loan">
-                                    <input type="hidden" name="loan_id" value="<?php echo $loan_id; ?>">
-                                    <input type="hidden" name="final_principal" value="<?php echo $remaining_principal; ?>">
-                                    <input type="hidden" name="final_interest" value="<?php echo $payable_interest; ?>">
-                                    <input type="hidden" name="receipt_charge" value="<?php echo $loan['receipt_charge']; ?>">
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label required">Close Date</label>
-                                        <input type="date" class="form-control" name="close_date" value="<?php echo date('Y-m-d'); ?>" required>
-                                    </div>
-                                    
-                                    <div class="row" style="display: flex; gap: 15px;">
-                                        <div style="flex: 1;">
-                                            <label class="form-label">Discount (₹)</label>
-                                            <input type="number" class="form-control" name="discount" id="discount" value="0" step="0.01" min="0">
-                                        </div>
-                                        <div style="flex: 1;">
-                                            <label class="form-label">Round Off (₹)</label>
-                                            <input type="number" class="form-control" name="round_off" id="round_off" value="0" step="0.01">
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="options-row">
-                                        <div class="option-item">
-                                            <input type="checkbox" name="d_namuna" id="modal_d_namuna">
-                                            <label for="modal_d_namuna">D-Namuna</label>
-                                        </div>
-                                        <div class="option-item">
-                                            <input type="checkbox" name="others" id="modal_others">
-                                            <label for="modal_others">Others</label>
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label required">Payment Mode</label>
-                                        <select class="form-select" name="payment_mode" required>
-                                            <option value="cash">Cash</option>
-                                            <option value="bank">Bank Transfer</option>
-                                            <option value="upi">UPI</option>
-                                            <option value="cheque">Cheque</option>
-                                        </select>
-                                    </div>
-                                    
-                                    <div class="form-group">
-                                        <label class="form-label">Remarks</label>
-                                        <textarea class="form-control" name="remarks" rows="2" placeholder="Enter remarks"></textarea>
-                                    </div>
-                                    
-                                    <div class="summary-box" style="background: #f7fafc; padding: 15px; border-radius: 8px; margin: 15px 0;">
-                                        <div class="info-row">
-                                            <span>Principal Due:</span>
-                                            <span>₹ <?php echo number_format($remaining_principal, 2); ?></span>
-                                        </div>
-                                        <div class="info-row">
-                                            <span>Interest Due:</span>
-                                            <span>₹ <?php echo number_format($payable_interest, 2); ?></span>
-                                        </div>
-                                        <div class="info-row">
-                                            <span>Receipt Charge:</span>
-                                            <span>₹ <?php echo number_format($loan['receipt_charge'], 2); ?></span>
-                                        </div>
-                                        <div class="info-row" style="border-top: 2px solid #48bb78; margin-top: 10px; padding-top: 10px;">
-                                            <span style="font-weight: 700;">Total Payable:</span>
-                                            <span style="font-weight: 700; color: #48bb78;">₹ <?php echo number_format($total_payable, 2); ?></span>
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="action-buttons" style="margin-top: 20px;">
-                                        <button type="button" class="btn btn-secondary" onclick="hideCloseModal()">Cancel</button>
-                                        <button type="submit" class="btn btn-success" onclick="return confirmClose()">Close Loan</button>
-                                    </div>
-                                </form>
-                            </div>
                         </div>
                     <?php endif; ?>
                 </div>
@@ -1406,9 +1546,182 @@ if (isset($_GET['success'])) {
         </div>
     </div>
 
+    <!-- Advance Payment Modal -->
+    <div class="modal" id="advanceModal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideAdvanceModal()">&times;</span>
+            <h3 class="modal-title">Add Advance Payment</h3>
+            
+            <form method="POST" action="">
+                <input type="hidden" name="action" value="pay_advance">
+                <input type="hidden" name="loan_id" value="<?php echo $loan['id'] ?? ''; ?>">
+                
+                <div class="form-group">
+                    <label class="form-label required">Advance Principal Amount (₹)</label>
+                    <input type="number" class="form-control" name="advance_principal" step="0.01" min="0" value="0">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label required">Advance Interest Amount (₹)</label>
+                    <input type="number" class="form-control" name="advance_interest" step="0.01" min="0" value="0">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label required">Payment Mode</label>
+                    <select class="form-select" name="payment_mode" required>
+                        <option value="cash">Cash</option>
+                        <option value="bank">Bank Transfer</option>
+                        <option value="upi">UPI</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Remarks</label>
+                    <textarea class="form-control" name="remarks" rows="2">Advance payment</textarea>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="hideAdvanceModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add Payment</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Close Loan Modal -->
+    <div class="modal" id="closeModal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="hideCloseModal()">&times;</span>
+            <h3 class="modal-title">Close Loan</h3>
+            
+            <form method="POST" action="" id="closeLoanForm">
+                <input type="hidden" name="action" value="close_loan">
+                <input type="hidden" name="loan_id" value="<?php echo $loan['id'] ?? ''; ?>">
+                
+                <div class="form-group">
+                    <label class="form-label required">Closing Date</label>
+                    <input type="date" class="form-control" name="close_date" value="<?php echo date('Y-m-d'); ?>" required>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label required">Final Principal (₹)</label>
+                    <input type="number" class="form-control" name="final_principal" id="final_principal" step="0.01" min="0" value="<?php echo $remaining_principal ?? 0; ?>" required onchange="updateTotalPayable()">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label required">Final Interest (₹)</label>
+                    <input type="number" class="form-control" name="final_interest" id="final_interest" step="0.01" min="0" value="<?php echo $payable_interest ?? 0; ?>" required onchange="updateTotalPayable()">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Receipt Charge (₹)</label>
+                    <input type="number" class="form-control" name="receipt_charge" id="receipt_charge" step="0.01" min="0" value="<?php echo $loan['receipt_charge'] ?? 0; ?>" onchange="updateTotalPayable()">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Discount (₹)</label>
+                    <input type="number" class="form-control" name="discount" id="discount" step="0.01" min="0" value="0" onchange="updateTotalPayable()">
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Round Off (₹)</label>
+                    <input type="number" class="form-control" name="round_off" id="round_off" step="0.01" value="0" onchange="updateTotalPayable()">
+                </div>
+                
+                <div class="summary-box">
+                    <div class="info-row">
+                        <span class="info-label">Total Payable:</span>
+                        <span class="info-value total" id="total_payable_display">₹ <?php echo number_format($total_payable ?? 0, 2); ?></span>
+                    </div>
+                </div>
+                
+                <div class="options-row">
+                    <div class="option-item">
+                        <input type="checkbox" name="d_namuna" id="d_namuna">
+                        <label for="d_namuna">D. Namuna</label>
+                    </div>
+                    <div class="option-item">
+                        <input type="checkbox" name="others" id="others">
+                        <label for="others">Others</label>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label required">Payment Mode</label>
+                    <select class="form-select" name="payment_mode" required>
+                        <option value="cash">Cash</option>
+                        <option value="bank">Bank Transfer</option>
+                        <option value="upi">UPI</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                
+                <!-- Jewelry Collection Person Section -->
+                <div class="collection-person-section">
+                    <div class="collection-person-title">
+                        <i class="bi bi-person-check"></i> Jewelry Collection Person Details
+                    </div>
+                    
+                    <div class="collection-type-buttons">
+                        <div class="collection-type-btn active" onclick="setCollectionType('customer')">
+                            <i class="bi bi-person"></i> Customer Self
+                        </div>
+                        <div class="collection-type-btn" onclick="setCollectionType('other')">
+                            <i class="bi bi-person-badge"></i> Other Person
+                        </div>
+                    </div>
+                    
+                    <input type="hidden" name="collection_type" id="collection_type" value="customer">
+                    
+                    <div id="otherPersonFields" class="other-person-fields">
+                        <div class="form-group">
+                            <label class="form-label required">Person Name</label>
+                            <input type="text" class="form-control" name="other_person_name" id="other_person_name">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label">Relation with Customer</label>
+                            <input type="text" class="form-control" name="other_person_relation" id="other_person_relation" placeholder="e.g., Brother, Father, Friend">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label">Mobile Number</label>
+                            <input type="text" class="form-control" name="other_person_mobile" id="other_person_mobile">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label class="form-label">ID Proof Number</label>
+                            <input type="text" class="form-control" name="other_person_id_proof" id="other_person_id_proof" placeholder="Aadhaar, Voter ID, etc.">
+                        </div>
+                    </div>
+                    
+                    <div class="options-row">
+                        <div class="option-item">
+                            <input type="checkbox" name="signature_verified" id="signature_verified">
+                            <label for="signature_verified">Signature Verified</label>
+                        </div>
+                        <div class="option-item">
+                            <input type="checkbox" name="id_proof_verified" id="id_proof_verified">
+                            <label for="id_proof_verified">ID Proof Verified</label>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label class="form-label">Remarks</label>
+                    <textarea class="form-control" name="remarks" rows="2">Loan closure</textarea>
+                </div>
+                
+                <div style="display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px;">
+                    <button type="button" class="btn btn-secondary" onclick="hideCloseModal()">Cancel</button>
+                    <button type="submit" class="btn btn-success" onclick="return confirmClose()">Close Loan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
-    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    
     <script>
         // Initialize date pickers
         flatpickr("input[type=date]", {
@@ -1416,24 +1729,142 @@ if (isset($_GET['success'])) {
             maxDate: "today"
         });
 
-        // Update options
-        document.getElementById('d_namuna')?.addEventListener('change', function() {
-            document.getElementById('option_d_namuna').value = this.checked ? 1 : 0;
-        });
-        
-        document.getElementById('others')?.addEventListener('change', function() {
-            document.getElementById('option_others').value = this.checked ? 1 : 0;
-        });
+        let remainingPrincipal = <?php echo $remaining_principal ?? 0; ?>;
+        let payableInterest = <?php echo $payable_interest ?? 0; ?>;
+        let receiptCharge = <?php echo $loan['receipt_charge'] ?? 0; ?>;
 
-        // Calculate advance total
-        function calculateAdvanceTotal() {
-            const principal = parseFloat(document.getElementById('advance_principal').value) || 0;
-            const interest = parseFloat(document.getElementById('advance_interest').value) || 0;
-            const total = principal + interest;
-            document.getElementById('advance_total').innerHTML = '₹ ' + total.toFixed(2);
+        // Live Search Functionality
+        let searchTimeout;
+        const searchInput = document.getElementById('liveSearch');
+        const searchResults = document.getElementById('searchResults');
+        const searchStats = document.getElementById('searchStats');
+        const resultCount = document.getElementById('resultCount');
+        const clearBtn = document.getElementById('clearSearch');
+
+        if (searchInput && searchInput.value.length > 0) {
+            clearBtn.style.display = 'block';
         }
 
-        // Show/hide modals
+        if (searchInput) {
+            searchInput.addEventListener('input', function() {
+                const term = this.value.trim();
+                
+                if (term.length > 0) {
+                    clearBtn.style.display = 'block';
+                } else {
+                    clearBtn.style.display = 'none';
+                    searchResults.classList.remove('show');
+                    searchStats.textContent = 'Type at least 2 characters to search';
+                    resultCount.textContent = '';
+                    return;
+                }
+
+                clearTimeout(searchTimeout);
+
+                if (term.length < 2) {
+                    searchResults.classList.remove('show');
+                    searchStats.textContent = 'Type at least 2 characters to search';
+                    resultCount.textContent = '';
+                    return;
+                }
+
+                searchResults.innerHTML = '<div class="loading-indicator"><i class="bi bi-arrow-repeat spin"></i> Searching...</div>';
+                searchResults.classList.add('show');
+                searchStats.textContent = `Searching for "${term}"...`;
+
+                searchTimeout = setTimeout(() => {
+                    fetch(`close-loan.php?ajax_search=1&term=${encodeURIComponent(term)}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            console.log('Search response:', data);
+                            
+                            if (data.error) {
+                                searchResults.innerHTML = `<div class="no-results"><i class="bi bi-exclamation-circle"></i><br>${data.error}</div>`;
+                                searchStats.textContent = 'Error searching';
+                                resultCount.textContent = '';
+                                return;
+                            }
+                            
+                            if (data.open_loans_count === 0) {
+                                searchResults.innerHTML = '<div class="no-results"><i class="bi bi-info-circle"></i><br>No open loans found in the system!<br>Please create a loan first.</div>';
+                                searchStats.textContent = 'No open loans available';
+                                resultCount.textContent = '';
+                                return;
+                            }
+
+                            const results = data.results || [];
+                            
+                            if (results.length === 0) {
+                                searchResults.innerHTML = `<div class="no-results"><i class="bi bi-search"></i><br>No open loans found matching "${term}"<br>Try a different search term</div>`;
+                                searchStats.textContent = `No results for "${term}"`;
+                                resultCount.textContent = '';
+                            } else {
+                                let html = '';
+                                results.forEach(loan => {
+                                    const matchClass = loan.match_type === 'exact' ? 'exact' : '';
+                                    const matchText = loan.match_type === 'exact' ? 'Exact Match' : 
+                                                    loan.match_type === 'receipt_start' ? 'Receipt Match' :
+                                                    loan.match_type === 'name_start' ? 'Name Match' : 'Partial Match';
+                                    
+                                    html += `
+                                        <div class="search-result-item" onclick="selectLoan(${loan.id})">
+                                            <div class="match-badge ${matchClass}">${matchText}</div>
+                                            <div class="result-receipt">${escapeHtml(loan.receipt_number)}</div>
+                                            <div class="result-customer">${escapeHtml(loan.customer_name)}</div>
+                                            <div class="result-details">
+                                                <span class="result-mobile">📞 ${escapeHtml(loan.mobile)}</span>
+                                                <span class="result-balance">💰 Principal: ₹${Number(loan.remaining_principal).toLocaleString()}</span>
+                                                <span class="result-due">📈 Interest: ₹${Number(loan.pending_interest).toLocaleString()}</span>
+                                                ${loan.overdue_amount > 0 ? `<span class="result-overdue">⚠️ Overdue: ₹${loan.overdue_amount.toLocaleString()}</span>` : ''}
+                                            </div>
+                                        </div>
+                                    `;
+                                });
+                                searchResults.innerHTML = html;
+                                searchStats.textContent = `Found ${results.length} result${results.length > 1 ? 's' : ''} for "${term}"`;
+                                resultCount.textContent = `${results.length} results`;
+                            }
+                        })
+                        .catch(error => {
+                            console.error('Search error:', error);
+                            searchResults.innerHTML = '<div class="no-results"><i class="bi bi-exclamation-triangle"></i><br>Error searching. Please try again.</div>';
+                            searchStats.textContent = 'Error occurred';
+                            resultCount.textContent = '';
+                        });
+                }, 300);
+            });
+        }
+
+        function clearSearch() {
+            if (searchInput) {
+                searchInput.value = '';
+                clearBtn.style.display = 'none';
+                searchResults.classList.remove('show');
+                searchStats.textContent = 'Type at least 2 characters to search';
+                resultCount.textContent = '';
+            }
+        }
+
+        function selectLoan(loanId) {
+            window.location.href = `close-loan.php?id=${loanId}`;
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Close search results when clicking outside
+        document.addEventListener('click', function(event) {
+            const searchContainer = document.querySelector('.live-search-container');
+            if (searchContainer && !searchContainer.contains(event.target)) {
+                if (searchResults) searchResults.classList.remove('show');
+            }
+        });
+
+        // Advance Modal Functions
         function showAdvanceModal() {
             document.getElementById('advanceModal').classList.add('active');
         }
@@ -1442,44 +1873,77 @@ if (isset($_GET['success'])) {
             document.getElementById('advanceModal').classList.remove('active');
         }
 
+        // Close Modal Functions
         function showCloseModal() {
             document.getElementById('closeModal').classList.add('active');
+            updateTotalPayable();
         }
 
         function hideCloseModal() {
             document.getElementById('closeModal').classList.remove('active');
         }
 
-        // Confirm close with SweetAlert
-        function confirmClose() {
-            Swal.fire({
-                title: 'Close Loan?',
-                text: 'Are you sure you want to close this loan? This action cannot be undone.',
-                icon: 'warning',
-                showCancelButton: true,
-                confirmButtonColor: '#48bb78',
-                cancelButtonColor: '#f56565',
-                confirmButtonText: 'Yes, Close Loan',
-                cancelButtonText: 'Cancel'
-            }).then((result) => {
-                if (result.isConfirmed) {
-                    document.getElementById('closeForm').submit();
-                }
-            });
-            return false;
+        function updateTotalPayable() {
+            const finalPrincipal = parseFloat(document.getElementById('final_principal')?.value) || 0;
+            const finalInterest = parseFloat(document.getElementById('final_interest')?.value) || 0;
+            const receiptCharge = parseFloat(document.getElementById('receipt_charge')?.value) || 0;
+            const discount = parseFloat(document.getElementById('discount')?.value) || 0;
+            const roundOff = parseFloat(document.getElementById('round_off')?.value) || 0;
+            
+            const total = finalPrincipal + finalInterest + receiptCharge - discount + roundOff;
+            const displayElement = document.getElementById('total_payable_display');
+            if (displayElement) {
+                displayElement.innerHTML = '₹ ' + total.toFixed(2);
+            }
         }
 
-        // Close modal when clicking outside
+        function confirmClose() {
+            const totalPayable = document.getElementById('total_payable_display')?.innerText || '₹ 0';
+            const collectionType = document.getElementById('collection_type').value;
+            
+            if (collectionType === 'other') {
+                const otherPersonName = document.getElementById('other_person_name')?.value;
+                if (!otherPersonName) {
+                    alert('Please enter the name of the person collecting the jewelry');
+                    return false;
+                }
+            }
+            
+            return confirm(`Are you sure you want to close this loan?\n\nTotal Payable: ${totalPayable}\n\nThis action cannot be undone!`);
+        }
+
+        // Collection Type Functions
+        function setCollectionType(type) {
+            document.getElementById('collection_type').value = type;
+            
+            const customerBtn = document.querySelector('.collection-type-btn:first-child');
+            const otherBtn = document.querySelector('.collection-type-btn:last-child');
+            const otherFields = document.getElementById('otherPersonFields');
+            
+            if (type === 'customer') {
+                customerBtn.classList.add('active');
+                otherBtn.classList.remove('active');
+                otherFields.classList.remove('show');
+                
+                // Clear other person fields
+                if (document.getElementById('other_person_name')) document.getElementById('other_person_name').value = '';
+                if (document.getElementById('other_person_relation')) document.getElementById('other_person_relation').value = '';
+                if (document.getElementById('other_person_mobile')) document.getElementById('other_person_mobile').value = '';
+                if (document.getElementById('other_person_id_proof')) document.getElementById('other_person_id_proof').value = '';
+            } else {
+                customerBtn.classList.remove('active');
+                otherBtn.classList.add('active');
+                otherFields.classList.add('show');
+            }
+        }
+
+        // Close modals when clicking outside
         window.onclick = function(event) {
             const advanceModal = document.getElementById('advanceModal');
             const closeModal = document.getElementById('closeModal');
             
-            if (event.target == advanceModal) {
-                hideAdvanceModal();
-            }
-            if (event.target == closeModal) {
-                hideCloseModal();
-            }
+            if (event.target == advanceModal) hideAdvanceModal();
+            if (event.target == closeModal) hideCloseModal();
         }
 
         // Auto-hide alerts after 5 seconds
@@ -1488,26 +1952,6 @@ if (isset($_GET['success'])) {
                 alert.style.display = 'none';
             });
         }, 5000);
-
-        // Show success message if redirected with success
-        <?php if (isset($_GET['success']) && $_GET['success'] == 'advance_added'): ?>
-        Swal.fire({
-            icon: 'success',
-            title: 'Success!',
-            text: 'Advance payment added successfully!',
-            timer: 3000,
-            showConfirmButton: false
-        });
-        <?php endif; ?>
-
-        // Show error message if any
-        <?php if (!empty($error)): ?>
-        Swal.fire({
-            icon: 'error',
-            title: 'Error!',
-            text: '<?php echo addslashes($error); ?>'
-        });
-        <?php endif; ?>
     </script>
 
     <?php include 'includes/scripts.php'; ?>
