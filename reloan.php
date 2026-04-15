@@ -142,63 +142,84 @@ if ($loan_id > 0) {
     if (mysqli_num_rows($loan_result) > 0) {
         $original_loan = mysqli_fetch_assoc($loan_result);
         
-        $total_paid_principal = $original_loan['total_principal_paid'] ?? 0;
-        $total_paid_interest = $original_loan['total_interest_paid'] ?? 0;
-        $remaining_principal = $original_loan['loan_amount'] - $total_paid_principal;
+        $total_paid_principal = isset($original_loan['total_principal_paid']) ? floatval($original_loan['total_principal_paid']) : 0;
+        $total_paid_interest = isset($original_loan['total_interest_paid']) ? floatval($original_loan['total_interest_paid']) : 0;
+        $remaining_principal = floatval($original_loan['loan_amount']) - $total_paid_principal;
         $total_paid = $total_paid_principal + $total_paid_interest;
         
         $customer = [
-            'id' => $original_loan['customer_id'],
-            'name' => $original_loan['customer_name'],
-            'guardian' => $original_loan['guardian_name'],
-            'guardian_type' => $original_loan['guardian_type'],
-            'mobile' => $original_loan['mobile_number'],
-            'whatsapp' => $original_loan['whatsapp_number'],
-            'email' => $original_loan['email'],
-            'address' => trim($original_loan['door_no'] . ' ' . $original_loan['street_name'] . ', ' . $original_loan['location'] . ', ' . $original_loan['district'] . ' - ' . $original_loan['pincode']),
-            'photo' => $original_loan['customer_photo'],
-            'loan_limit' => $original_loan['loan_limit_amount'],
-            'active_loans' => ($original_loan['total_active_loans_excluding_current'] ?? 0) + ($original_loan['status'] == 'open' ? $original_loan['loan_amount'] : 0)
+            'id' => isset($original_loan['customer_id']) ? $original_loan['customer_id'] : 0,
+            'name' => isset($original_loan['customer_name']) ? $original_loan['customer_name'] : '',
+            'guardian' => isset($original_loan['guardian_name']) ? $original_loan['guardian_name'] : '',
+            'guardian_type' => isset($original_loan['guardian_type']) ? $original_loan['guardian_type'] : '',
+            'mobile' => isset($original_loan['mobile_number']) ? $original_loan['mobile_number'] : '',
+            'whatsapp' => isset($original_loan['whatsapp_number']) ? $original_loan['whatsapp_number'] : '',
+            'email' => isset($original_loan['email']) ? $original_loan['email'] : '',
+            'address' => trim(
+                (isset($original_loan['door_no']) ? $original_loan['door_no'] : '') . ' ' . 
+                (isset($original_loan['street_name']) ? $original_loan['street_name'] : '') . ', ' . 
+                (isset($original_loan['location']) ? $original_loan['location'] : '') . ', ' . 
+                (isset($original_loan['district']) ? $original_loan['district'] : '') . ' - ' . 
+                (isset($original_loan['pincode']) ? $original_loan['pincode'] : '')
+            ),
+            'photo' => isset($original_loan['customer_photo']) ? $original_loan['customer_photo'] : '',
+            'loan_limit' => isset($original_loan['loan_limit_amount']) ? floatval($original_loan['loan_limit_amount']) : 0,
+            'active_loans' => (isset($original_loan['total_active_loans_excluding_current']) ? floatval($original_loan['total_active_loans_excluding_current']) : 0) + 
+                              ($original_loan['status'] == 'open' ? floatval($original_loan['loan_amount']) : 0)
         ];
         
-        $items_query = "SELECT * FROM loan_items WHERE loan_id = ?";
-        $stmt = mysqli_prepare($conn, $items_query);
-        mysqli_stmt_bind_param($stmt, 'i', $loan_id);
-        mysqli_stmt_execute($stmt);
-        $items_result = mysqli_stmt_get_result($stmt);
+        // Get loan items
+        $items_query = "SELECT * FROM loan_items WHERE loan_id = " . $loan_id;
+        $items_result = mysqli_query($conn, $items_query);
         
-        while ($item = mysqli_fetch_assoc($items_result)) {
-            $items[] = $item;
+        $items = array();
+        if (mysqli_num_rows($items_result) > 0) {
+            while ($item = mysqli_fetch_assoc($items_result)) {
+                $items[] = array(
+                    'id' => $item['id'],
+                    'jewel_name' => $item['jewel_name'],
+                    'karat' => floatval($item['karat']),
+                    'defect_details' => isset($item['defect_details']) ? $item['defect_details'] : '',
+                    'stone_details' => isset($item['stone_details']) ? $item['stone_details'] : '',
+                    'gross_weight' => isset($item['gross_weight']) ? floatval($item['gross_weight']) : floatval($item['net_weight']),
+                    'net_weight' => floatval($item['net_weight']),
+                    'quantity' => intval($item['quantity']),
+                    'photo_path' => isset($item['photo_path']) ? $item['photo_path'] : ''
+                );
+            }
         }
         
-        $value_query = "SELECT * FROM product_value_settings WHERE product_type = ? LIMIT 1";
-        $stmt = mysqli_prepare($conn, $value_query);
-        mysqli_stmt_bind_param($stmt, 's', $original_loan['product_type']);
-        mysqli_stmt_execute($stmt);
-        $value_result = mysqli_stmt_get_result($stmt);
+        // Get product value settings from database
+        $product_type = isset($original_loan['product_type']) ? $original_loan['product_type'] : 'தங்கம்';
+        $value_query = "SELECT * FROM product_value_settings WHERE product_type = '" . mysqli_real_escape_string($conn, $product_type) . "' LIMIT 1";
+        $value_result = mysqli_query($conn, $value_query);
         $value_settings = mysqli_fetch_assoc($value_result);
         
         if ($value_settings) {
-            $current_value_per_gram = $value_settings['total_value_per_gram'];
-            $current_loan_percentage = $value_settings['percentage'];
+            $current_value_per_gram = isset($value_settings['total_value_per_gram']) ? floatval($value_settings['total_value_per_gram']) : 10000;
+            $current_loan_percentage = isset($value_settings['regular_loan_percentage']) ? floatval($value_settings['regular_loan_percentage']) : 70;
+            $personal_loan_percentage = isset($value_settings['personal_loan_percentage']) ? floatval($value_settings['personal_loan_percentage']) : 0;
         } else {
             $current_value_per_gram = 10000;
-            $current_loan_percentage = 75;
+            $current_loan_percentage = 70;
+            $personal_loan_percentage = 0;
         }
         
         $total_net_weight = 0;
         foreach ($items as &$item) {
-            $total_net_weight += $item['net_weight'] * $item['quantity'];
+            $total_net_weight += floatval($item['net_weight']) * intval($item['quantity']);
             $item['current_value_per_gram'] = $current_value_per_gram;
-            $item['new_product_value'] = $item['net_weight'] * $current_value_per_gram;
-            $item['new_loan_amount'] = ($item['net_weight'] * $current_value_per_gram * $current_loan_percentage) / 100;
+            $item['new_product_value'] = floatval($item['net_weight']) * $current_value_per_gram;
+            $item['new_loan_amount'] = (floatval($item['net_weight']) * $current_value_per_gram * $current_loan_percentage) / 100;
         }
         
         $new_product_value = $total_net_weight * $current_value_per_gram;
         $calculated_loan_amount = ($new_product_value * $current_loan_percentage) / 100;
+        $personal_loan_amount = ($new_product_value * $personal_loan_percentage) / 100;
+        $total_available_loan = $calculated_loan_amount + $personal_loan_amount;
         $new_max_value = $total_net_weight * $current_value_per_gram;
-        $value_increase = $new_product_value - $original_loan['product_value'];
-        $percentage_increase = $original_loan['product_value'] > 0 ? round(($value_increase / $original_loan['product_value']) * 100, 1) : 0;
+        $value_increase = $new_product_value - (isset($original_loan['product_value']) ? floatval($original_loan['product_value']) : 0);
+        $percentage_increase = (isset($original_loan['product_value']) && $original_loan['product_value'] > 0) ? round(($value_increase / $original_loan['product_value']) * 100, 1) : 0;
         
         $active_loans_total = $customer['active_loans'];
         if ($original_loan['status'] == 'open') {
@@ -237,23 +258,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
     
     $customer_id = intval($_POST['customer_id'] ?? 0);
-    $product_type = mysqli_real_escape_string($conn, $_POST['product_type'] ?? '');
+    $product_type = isset($_POST['product_type']) ? mysqli_real_escape_string($conn, $_POST['product_type']) : '';
     $loan_amount = floatval($_POST['loan_amount'] ?? 0);
     $extra_amount = floatval($_POST['extra_amount'] ?? 0);
-    $interest_type = mysqli_real_escape_string($conn, $_POST['interest_type'] ?? '');
+    $interest_type = isset($_POST['interest_type']) ? mysqli_real_escape_string($conn, $_POST['interest_type']) : '';
     $interest_rate = floatval($_POST['interest_rate'] ?? 0);
     $process_charge = floatval($_POST['process_charge'] ?? 0);
     $appraisal_charge = floatval($_POST['appraisal_charge'] ?? 0);
     $employee_id = intval($_POST['employee_id'] ?? 0);
     $product_value = floatval($_POST['product_value'] ?? 0);
     $max_value = floatval($_POST['max_value'] ?? 0);
-    $payment_method = mysqli_real_escape_string($conn, $_POST['payment_method'] ?? 'cash');
-    $interest_calculation = mysqli_real_escape_string($conn, $_POST['interest_calculation'] ?? 'daily');
+    $payment_method = isset($_POST['payment_method']) ? mysqli_real_escape_string($conn, $_POST['payment_method']) : 'cash';
+    $interest_calculation = isset($_POST['interest_calculation']) ? mysqli_real_escape_string($conn, $_POST['interest_calculation']) : 'daily';
     
     $bank_id = isset($_POST['bank_id']) ? intval($_POST['bank_id']) : 0;
     $bank_account_id = isset($_POST['bank_account_id']) ? intval($_POST['bank_account_id']) : 0;
-    $transaction_ref = mysqli_real_escape_string($conn, $_POST['transaction_ref'] ?? '');
-    $payment_date = mysqli_real_escape_string($conn, $_POST['payment_date'] ?? date('Y-m-d'));
+    $transaction_ref = isset($_POST['transaction_ref']) ? mysqli_real_escape_string($conn, $_POST['transaction_ref']) : '';
+    $payment_date = isset($_POST['payment_date']) ? mysqli_real_escape_string($conn, $_POST['payment_date']) : date('Y-m-d');
     
     $gross_weight = floatval($_POST['gross_weight'] ?? 0);
     $net_weight = floatval($_POST['net_weight'] ?? 0);
@@ -283,7 +304,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $limit_data = mysqli_fetch_assoc($limit_result);
             
             if ($limit_data) {
-                $current_used = $limit_data['total_loans_taken'];
+                $current_used = isset($limit_data['total_loans_taken']) ? floatval($limit_data['total_loans_taken']) : 0;
                 $total_after_reloan = $current_used + $loan_amount;
                 
                 if ($total_after_reloan > $limit_data['loan_limit_amount']) {
@@ -307,7 +328,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         mysqli_stmt_execute($balance_stmt);
         $balance_result = mysqli_stmt_get_result($balance_stmt);
         $balance_row = mysqli_fetch_assoc($balance_result);
-        $current_balance = $balance_row['current_balance'] ?? 0;
+        $current_balance = isset($balance_row['current_balance']) ? floatval($balance_row['current_balance']) : 0;
         
         if ($loan_amount > $current_balance) {
             $errors[] = "Insufficient bank balance! Available: ₹" . number_format($current_balance, 2) . 
@@ -400,13 +421,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 
                 for ($i = 0; $i < count($_POST['item_id']); $i++) {
                     $original_item_id = intval($_POST['item_id'][$i]);
-                    $jewel_name = mysqli_real_escape_string($conn, $_POST['jewel_name'][$i] ?? '');
-                    $karat = floatval($_POST['karat'][$i] ?? 0);
-                    $defect = mysqli_real_escape_string($conn, $_POST['defect'][$i] ?? '');
-                    $stone = mysqli_real_escape_string($conn, $_POST['stone'][$i] ?? '');
-                    $item_gross_weight = floatval($_POST['item_gross_weight'][$i] ?? 0);
-                    $item_net_weight = floatval($_POST['item_net_weight'][$i] ?? 0);
-                    $quantity = intval($_POST['quantity'][$i] ?? 1);
+                    $jewel_name = isset($_POST['jewel_name'][$i]) ? mysqli_real_escape_string($conn, $_POST['jewel_name'][$i]) : '';
+                    $karat = isset($_POST['karat'][$i]) ? floatval($_POST['karat'][$i]) : 0;
+                    $defect = isset($_POST['defect'][$i]) ? mysqli_real_escape_string($conn, $_POST['defect'][$i]) : '';
+                    $stone = isset($_POST['stone'][$i]) ? mysqli_real_escape_string($conn, $_POST['stone'][$i]) : '';
+                    $item_gross_weight = isset($_POST['item_gross_weight'][$i]) ? floatval($_POST['item_gross_weight'][$i]) : 0;
+                    $item_net_weight = isset($_POST['item_net_weight'][$i]) ? floatval($_POST['item_net_weight'][$i]) : 0;
+                    $quantity = isset($_POST['quantity'][$i]) ? intval($_POST['quantity'][$i]) : 1;
                     
                     $jewel_photo = null;
                     
@@ -519,7 +540,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
                 mysqli_stmt_execute($balance_stmt);
                 $balance_result = mysqli_stmt_get_result($balance_stmt);
                 $balance_row = mysqli_fetch_assoc($balance_result);
-                $current_balance = $balance_row['current_balance'] ?? 0;
+                $current_balance = isset($balance_row['current_balance']) ? floatval($balance_row['current_balance']) : 0;
                 
                 if ($loan_amount > $current_balance) {
                     throw new Exception("Insufficient bank balance! Available: ₹" . number_format($current_balance, 2));
@@ -777,27 +798,29 @@ function safeEscape($value) {
             overflow-x: auto;
         }
 
-        .search-results-table table {
+        .table-responsive {
+            overflow-x: auto;
+            width: 100%;
+        }
+
+        .table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 14px;
         }
 
-        .search-results-table th {
+        .table th, .table td {
+            padding: 12px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .table th {
             background: #f7fafc;
-            padding: 12px;
-            text-align: left;
             font-weight: 600;
-            color: #4a5568;
-            border-bottom: 2px solid #e2e8f0;
+            text-align: left;
+            white-space: nowrap;
         }
 
-        .search-results-table td {
-            padding: 12px;
-            border-bottom: 1px solid #e2e8f0;
-        }
-
-        .search-results-table tr:hover {
+        .table tbody tr:hover {
             background: #f7fafc;
             cursor: pointer;
         }
@@ -902,18 +925,8 @@ function safeEscape($value) {
             gap: 20px;
         }
 
-        .form-grid-3 {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-        }
-
         .form-group {
             margin-bottom: 15px;
-        }
-
-        .form-group.full-width {
-            grid-column: 1 / -1;
         }
 
         .form-label {
@@ -1028,15 +1041,6 @@ function safeEscape($value) {
 
         .btn-secondary:hover {
             background: #718096;
-        }
-
-        .btn-info {
-            background: #4299e1;
-            color: white;
-        }
-
-        .btn-info:hover {
-            background: #3182ce;
         }
 
         .btn-sm {
@@ -1441,12 +1445,6 @@ function safeEscape($value) {
             font-size: 13px;
         }
 
-        .original-value {
-            font-size: 11px;
-            color: #718096;
-            margin-top: 2px;
-        }
-
         .jewelry-photo-section {
             display: flex;
             flex-direction: column;
@@ -1483,11 +1481,6 @@ function safeEscape($value) {
 
         .camera-btn-upload {
             background: #48bb78;
-            color: white;
-        }
-
-        .camera-btn-switch {
-            background: #9f7aea;
             color: white;
         }
 
@@ -1595,10 +1588,6 @@ function safeEscape($value) {
             border-bottom: 1px solid #e2e8f0;
         }
 
-        .summary-row:last-child {
-            border-bottom: none;
-        }
-
         .summary-label {
             font-weight: 600;
             color: #4a5568;
@@ -1692,7 +1681,7 @@ function safeEscape($value) {
                 text-align: center;
             }
             
-            .form-grid, .form-grid-2, .form-grid-3, .info-grid {
+            .form-grid, .form-grid-2 {
                 grid-template-columns: 1fr;
             }
             
@@ -1799,10 +1788,12 @@ function safeEscape($value) {
                                 </button>
                             </form>
 
+                            <!-- Search Results Table -->
                             <?php if ($search_results && mysqli_num_rows($search_results) > 0): ?>
-                                <div class="search-results-table">
-                                    <h4 style="margin: 20px 0 15px; color: #2d3748;">Search Results</h4>
-                                    <table>
+                            <div class="search-results-table">
+                                <h4 style="margin: 20px 0 15px; color: #2d3748;">Search Results</h4>
+                                <div class="table-responsive">
+                                    <table class="table">
                                         <thead>
                                             <tr>
                                                 <th>Receipt No</th>
@@ -1816,8 +1807,6 @@ function safeEscape($value) {
                                         </thead>
                                         <tbody>
                                             <?php while($loan = mysqli_fetch_assoc($search_results)): 
-                                                $total_paid = ($loan['total_principal_paid'] ?? 0) + ($loan['total_interest_paid'] ?? 0);
-                                                $remaining = $loan['loan_amount'] - ($loan['total_principal_paid'] ?? 0);
                                                 $status_class = '';
                                                 $status_text = ucfirst($loan['status']);
                                                 
@@ -1833,7 +1822,7 @@ function safeEscape($value) {
                                                 <td><?php echo date('d/m/Y', strtotime($loan['receipt_date'])); ?></td>
                                                 <td><span class="status-badge <?php echo $status_class; ?>"><?php echo $status_text; ?></span></td>
                                                 <td>
-                                                    <a href="?select=<?php echo (int)$loan['id']; ?>" class="btn btn-sm btn-info">
+                                                    <a href="?select=<?php echo (int)$loan['id']; ?>" class="btn btn-sm btn-info" style="background: #4299e1; color: white; padding: 5px 10px; border-radius: 6px; text-decoration: none;">
                                                         <i class="bi bi-arrow-repeat"></i> Select
                                                     </a>
                                                 </td>
@@ -1842,54 +1831,68 @@ function safeEscape($value) {
                                         </tbody>
                                     </table>
                                 </div>
+                            </div>
                             <?php elseif ($search_term && mysqli_num_rows($search_results) == 0): ?>
-                                <div class="alert alert-warning mt-3">
-                                    <i class="bi bi-exclamation-triangle-fill"></i>
-                                    No loans found matching "<?php echo safeEscape($search_term); ?>"
-                                </div>
+                            <div class="alert alert-warning mt-3">
+                                <i class="bi bi-exclamation-triangle-fill"></i>
+                                No loans found matching "<?php echo safeEscape($search_term); ?>"
+                            </div>
                             <?php endif; ?>
 
-                            <!-- Recent Loans (Open and Closed) -->
+                            <!-- Recent Loans Section -->
                             <div style="margin-top: 30px;">
                                 <h4 style="margin-bottom: 15px; color: #2d3748;">Recent Loans</h4>
-                                <div class="search-results-table">
-                                    <table>
-                                        <thead>
-                                            <tr>
-                                                <th>Receipt No</th>
-                                                <th>Customer</th>
-                                                <th>Mobile</th>
-                                                <th>Amount</th>
-                                                <th>Status</th>
-                                                <th>Action</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <?php
-                                            $recent_loans_query = "SELECT l.*, c.customer_name, c.mobile_number
-                                                                   FROM loans l 
-                                                                   JOIN customers c ON l.customer_id = c.id 
-                                                                   WHERE l.status IN ('open', 'closed')
-                                                                   ORDER BY l.created_at DESC LIMIT 10";
-                                            $recent_result = mysqli_query($conn, $recent_loans_query);
-                                            while($recent = mysqli_fetch_assoc($recent_result)):
-                                                $status_class = $recent['status'] == 'open' ? 'status-open' : 'status-closed';
-                                            ?>
-                                            <tr>
-                                                <td><strong><?php echo safeEscape($recent['receipt_number']); ?></strong></td>
-                                                <td><?php echo safeEscape($recent['customer_name']); ?></td>
-                                                <td><?php echo safeEscape($recent['mobile_number']); ?></td>
-                                                <td>₹ <?php echo number_format((float)$recent['loan_amount'], 2); ?></td>
-                                                <td><span class="status-badge <?php echo $status_class; ?>"><?php echo ucfirst($recent['status']); ?></span></td>
-                                                <td>
-                                                    <a href="?select=<?php echo (int)$recent['id']; ?>" class="btn btn-sm btn-info">
-                                                        <i class="bi bi-arrow-repeat"></i> Reloan
-                                                    </a>
-                                                </td>
-                                            </tr>
-                                            <?php endwhile; ?>
-                                        </tbody>
-                                    </table>
+                                <div class="recent-loans-table">
+                                    <div class="table-responsive">
+                                        <table class="table">
+                                            <thead>
+                                                <tr>
+                                                    <th>Receipt No</th>
+                                                    <th>Customer</th>
+                                                    <th>Mobile</th>
+                                                    <th>Amount</th>
+                                                    <th>Status</th>
+                                                    <th>Action</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <?php
+                                                $recent_loans_query = "SELECT l.*, c.customer_name, c.mobile_number
+                                                                       FROM loans l 
+                                                                       JOIN customers c ON l.customer_id = c.id 
+                                                                       WHERE l.status IN ('open', 'closed')
+                                                                       ORDER BY l.created_at DESC LIMIT 10";
+                                                $recent_result = mysqli_query($conn, $recent_loans_query);
+                                                if ($recent_result && mysqli_num_rows($recent_result) > 0):
+                                                    while($recent = mysqli_fetch_assoc($recent_result)):
+                                                        $status_class = $recent['status'] == 'open' ? 'status-open' : 'status-closed';
+                                                ?>
+                                                <tr onclick="window.location.href='?select=<?php echo (int)$recent['id']; ?>'">
+                                                    <td><strong><?php echo safeEscape($recent['receipt_number']); ?></strong></td>
+                                                    <td><?php echo safeEscape($recent['customer_name']); ?></td>
+                                                    <td><?php echo safeEscape($recent['mobile_number']); ?></td>
+                                                    <td>₹ <?php echo number_format((float)$recent['loan_amount'], 2); ?></td>
+                                                    <td><span class="status-badge <?php echo $status_class; ?>"><?php echo ucfirst($recent['status']); ?></span></td>
+                                                    <td>
+                                                        <a href="?select=<?php echo (int)$recent['id']; ?>" class="btn btn-sm btn-info" style="background: #4299e1; color: white; padding: 5px 10px; border-radius: 6px; text-decoration: none;">
+                                                            <i class="bi bi-arrow-repeat"></i> Reloan
+                                                        </a>
+                                                    </td>
+                                                </tr>
+                                                <?php 
+                                                    endwhile;
+                                                else:
+                                                ?>
+                                                <tr>
+                                                    <td colspan="6" style="text-align: center; padding: 40px;">
+                                                        <i class="bi bi-inbox" style="font-size: 48px; color: #cbd5e0; display: block; margin-bottom: 10px;"></i>
+                                                        No recent loans found
+                                                    </td>
+                                                </tr>
+                                                <?php endif; ?>
+                                            </tbody>
+                                        </table>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -1920,7 +1923,7 @@ function safeEscape($value) {
                                 </div>
                                 <div class="info-item">
                                     <div class="info-label">Net Weight</div>
-                                    <div class="info-value"><?php echo safeEscape($original_loan['net_weight']); ?> g</div>
+                                    <div class="info-value"><?php echo number_format((float)($original_loan['net_weight'] ?? 0), 3); ?> g</div>
                                 </div>
                             </div>
 
@@ -1942,7 +1945,7 @@ function safeEscape($value) {
                             <div class="alert alert-info mt-3">
                                 <i class="bi bi-graph-up-arrow"></i>
                                 <strong>Current Market Value:</strong> 
-                                Product value has changed from ₹<?php echo number_format((float)$original_loan['product_value'], 2); ?> 
+                                Product value has changed from ₹<?php echo number_format((float)($original_loan['product_value'] ?? 0), 2); ?> 
                                 to <strong class="text-success">₹<?php echo number_format($new_product_value, 2); ?></strong> 
                                 (<?php echo $percentage_increase; ?>% change)
                             </div>
@@ -1974,12 +1977,6 @@ function safeEscape($value) {
                                 <div class="customer-details">
                                     <div class="customer-name">
                                         <?php echo safeEscape($customer['name']); ?>
-                                        <?php if (!empty($original_loan['d_namuna'])): ?>
-                                            <span class="badge bg-warning">D-NAMUNA</span>
-                                        <?php endif; ?>
-                                        <?php if (!empty($original_loan['others'])): ?>
-                                            <span class="badge bg-info">OTHERS</span>
-                                        <?php endif; ?>
                                     </div>
                                     <div class="customer-contact">
                                         <span><i class="bi bi-phone"></i> <?php echo safeEscape($customer['mobile']); ?></span>
@@ -2003,7 +2000,7 @@ function safeEscape($value) {
                                     <?php 
                                     $percentage_used = $customer['loan_limit'] > 0 ? ($customer['active_loans'] / $customer['loan_limit']) * 100 : 0;
                                     ?>
-                                    <div class="loan-limit-progress-bar" style="width: <?php echo $percentage_used; ?>%"></div>
+                                    <div class="loan-limit-progress-bar" style="width: <?php echo min(100, $percentage_used); ?>%"></div>
                                 </div>
                                 <div class="loan-limit-details">
                                     <span>Total Limit: ₹ <?php echo number_format((float)$customer['loan_limit'], 2); ?></span>
@@ -2066,8 +2063,8 @@ function safeEscape($value) {
                                         <label class="form-label required">Product Type</label>
                                         <div class="input-group">
                                             <i class="bi bi-tag input-icon"></i>
-                                            <input type="text" class="form-control readonly-field" value="<?php echo safeEscape($original_loan['product_type']); ?>" readonly>
-                                            <input type="hidden" name="product_type" value="<?php echo safeEscape($original_loan['product_type']); ?>">
+                                            <input type="text" class="form-control readonly-field" name="product_type_display" id="product_type_display" value="<?php echo isset($original_loan['product_type']) ? safeEscape($original_loan['product_type']) : 'தங்கம்'; ?>" readonly>
+                                            <input type="hidden" name="product_type" value="<?php echo isset($original_loan['product_type']) ? safeEscape($original_loan['product_type']) : 'தங்கம்'; ?>">
                                         </div>
                                     </div>
 
@@ -2083,7 +2080,7 @@ function safeEscape($value) {
                                                     while($it = mysqli_fetch_assoc($interest_types_result)): 
                                                 ?>
                                                     <option value="<?php echo safeEscape($it['interest_type']); ?>" data-rate="<?php echo safeEscape($it['rate']); ?>"
-                                                        <?php echo ($it['interest_type'] == $original_loan['interest_type']) ? 'selected' : ''; ?>>
+                                                        <?php echo (isset($original_loan['interest_type']) && $it['interest_type'] == $original_loan['interest_type']) ? 'selected' : ''; ?>>
                                                         <?php echo safeEscape($it['interest_type'] . ' (' . $it['rate'] . '%)'); ?>
                                                     </option>
                                                 <?php 
@@ -2098,7 +2095,7 @@ function safeEscape($value) {
                                         <label class="form-label">Interest Rate (%)</label>
                                         <div class="input-group">
                                             <i class="bi bi-percent input-icon"></i>
-                                            <input type="number" class="form-control" name="interest_rate" id="interest_rate" step="0.01" min="0" value="<?php echo safeEscape($original_loan['interest_amount']); ?>" readonly>
+                                            <input type="number" class="form-control" name="interest_rate" id="interest_rate" step="0.01" min="0" value="<?php echo isset($original_loan['interest_amount']) ? safeEscape($original_loan['interest_amount']) : '0'; ?>" readonly>
                                         </div>
                                     </div>
 
@@ -2150,7 +2147,7 @@ function safeEscape($value) {
                                     </div>
                                 </div>
 
-                                <!-- New Loan Amount Section - Editable -->
+                                <!-- New Loan Amount Section -->
                                 <div class="loan-amount-section">
                                     <div class="loan-amount-title">
                                         <i class="bi bi-cash-coin"></i> New Loan Amount
@@ -2265,198 +2262,7 @@ function safeEscape($value) {
                             </div>
 
                             <!-- Jewelry Items Table -->
-                            <div class="form-card">
-                                <div class="section-title">
-                                    <i class="bi bi-grid-3x3-gap-fill"></i>
-                                    Jewelry Items (Updated Values)
-                                </div>
-
-                                <table class="jewelry-table" id="jewelryTable">
-                                    <thead>
-                                        <tr>
-                                            <th>S.No</th>
-                                            <th>Jewel Name</th>
-                                            <th>Karat</th>
-                                            <th>Defect</th>
-                                            <th>Stone</th>
-                                            <th>Gross (g)</th>
-                                            <th>Margin (g)</th>
-                                            <th>Net (g)</th>
-                                            <th>Qty</th>
-                                            <th>Photo</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="jewelryBody">
-                                        <?php foreach ($items as $index => $item): ?>
-                                        <tr id="row<?php echo $index + 1; ?>">
-                                            <td><?php echo $index + 1; ?></td>
-                                            <td>
-                                                <input type="hidden" name="item_id[]" value="<?php echo (int)$item['id']; ?>">
-                                                <select name="jewel_name[]" class="form-select">
-                                                    <option value="">Select</option>
-                                                    <?php 
-                                                    if ($jewel_names_result && mysqli_num_rows($jewel_names_result) > 0) {
-                                                        mysqli_data_seek($jewel_names_result, 0);
-                                                        while($jewel = mysqli_fetch_assoc($jewel_names_result)): 
-                                                    ?>
-                                                        <option value="<?php echo safeEscape($jewel['jewel_name']); ?>"
-                                                            <?php echo ($jewel['jewel_name'] == $item['jewel_name']) ? 'selected' : ''; ?>>
-                                                            <?php echo safeEscape($jewel['jewel_name']); ?>
-                                                        </option>
-                                                    <?php 
-                                                        endwhile;
-                                                    }
-                                                    ?>
-                                                </select>
-                                            </td>
-                                            <td>
-                                                <select name="karat[]" class="form-select" onchange="updateItemValues(this)">
-                                                    <option value="">Select</option>
-                                                    <?php 
-                                                    if ($karat_result && mysqli_num_rows($karat_result) > 0) {
-                                                        mysqli_data_seek($karat_result, 0);
-                                                        while($karat = mysqli_fetch_assoc($karat_result)): 
-                                                    ?>
-                                                        <option value="<?php echo safeEscape($karat['karat']); ?>" 
-                                                                data-max="<?php echo (float)$karat['max_value_per_gram']; ?>"
-                                                                <?php echo ($karat['karat'] == $item['karat']) ? 'selected' : ''; ?>>
-                                                            <?php echo safeEscape($karat['karat']); ?>K
-                                                        </option>
-                                                    <?php 
-                                                        endwhile;
-                                                    }
-                                                    ?>
-                                                </select>
-                                            </td>
-                                            <td>
-                                                <select name="defect[]" class="form-select">
-                                                    <option value="">Select</option>
-                                                    <?php 
-                                                    if ($defect_result && mysqli_num_rows($defect_result) > 0) {
-                                                        mysqli_data_seek($defect_result, 0);
-                                                        while($defect = mysqli_fetch_assoc($defect_result)): 
-                                                    ?>
-                                                        <option value="<?php echo safeEscape($defect['defect_name']); ?>"
-                                                            <?php echo ($defect['defect_name'] == $item['defect_details']) ? 'selected' : ''; ?>>
-                                                            <?php echo safeEscape($defect['defect_name']); ?>
-                                                        </option>
-                                                    <?php 
-                                                        endwhile;
-                                                    }
-                                                    ?>
-                                                </select>
-                                            </td>
-                                            <td>
-                                                <select name="stone[]" class="form-select">
-                                                    <option value="">Select</option>
-                                                    <?php 
-                                                    if ($stone_result && mysqli_num_rows($stone_result) > 0) {
-                                                        mysqli_data_seek($stone_result, 0);
-                                                        while($stone = mysqli_fetch_assoc($stone_result)): 
-                                                    ?>
-                                                        <option value="<?php echo safeEscape($stone['stone_name']); ?>"
-                                                            <?php echo ($stone['stone_name'] == $item['stone_details']) ? 'selected' : ''; ?>>
-                                                            <?php echo safeEscape($stone['stone_name']); ?>
-                                                        </option>
-                                                    <?php 
-                                                        endwhile;
-                                                    }
-                                                    ?>
-                                                </select>
-                                            </td>
-                                            <td>
-                                                <input type="number" name="item_gross_weight[]" step="0.001" min="0" 
-                                                       class="gross-weight" value="<?php echo (float)($item['gross_weight'] ?? 0); ?>"
-                                                       onchange="calculateNetWeight(this); updateItemValues(this)">
-                                            </td>
-                                            <td>
-                                                <input type="number" name="item_margin_weight[]" step="0.001" min="0" 
-                                                       class="margin-weight" value="0"
-                                                       onchange="calculateNetWeight(this); updateItemValues(this)">
-                                            </td>
-                                            <td>
-                                                <input type="number" name="item_net_weight[]" step="0.001" min="0" 
-                                                       class="net-weight" value="<?php echo (float)$item['net_weight']; ?>" readonly>
-                                            </td>
-                                            <td>
-                                                <input type="number" name="quantity[]" value="<?php echo (int)$item['quantity']; ?>" 
-                                                       min="1" onchange="updateTotalWeight()">
-                                            </td>
-                                            <td>
-                                                <div class="jewelry-photo-section">
-                                                    <div class="photo-btn-group">
-                                                        <button type="button" onclick="openJewelCamera(this, <?php echo $index + 1; ?>)" 
-                                                                class="camera-btn camera-btn-capture" title="Take Photo">
-                                                            <i class="bi bi-camera"></i>
-                                                        </button>
-                                                        <label class="camera-btn camera-btn-upload" title="Upload Photo">
-                                                            <i class="bi bi-cloud-upload"></i>
-                                                            <input type="file" name="jewel_photo_<?php echo $index; ?>" accept="image/*" style="display: none;" 
-                                                                   onchange="previewJewelPhoto(this, <?php echo $index + 1; ?>)">
-                                                        </label>
-                                                    </div>
-                                                    <input type="hidden" id="jewel_photo_camera_<?php echo $index + 1; ?>" name="jewel_photo_camera_<?php echo $index; ?>">
-                                                    <div class="photo-preview-container" id="photo_preview_<?php echo $index + 1; ?>" style="display: none;">
-                                                        <img src="" class="jewel-photo-preview" alt="Preview">
-                                                    </div>
-                                                    <small class="photo-filename" id="jewel_photo_name_<?php echo $index + 1; ?>">
-                                                        <?php if (!empty($item['photo_path'])): ?>
-                                                            <i class="bi bi-check-circle-fill" style="color:#48bb78;"></i> Original photo available
-                                                        <?php endif; ?>
-                                                    </small>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                        <?php endforeach; ?>
-                                    </tbody>
-                                </table>
-
-                                <!-- Weight Summary -->
-                                <div class="summary-box">
-                                    <h4 style="margin-bottom: 15px; color: #2d3748;">Weight & Value Summary</h4>
-                                    <div class="summary-row">
-                                        <span class="summary-label">Total Gross Weight:</span>
-                                        <span class="summary-value" id="total_gross_weight"><?php echo number_format((float)$original_loan['gross_weight'], 3); ?> g</span>
-                                    </div>
-                                    <div class="summary-row">
-                                        <span class="summary-label">Total Margin Weight:</span>
-                                        <span class="summary-value" id="total_margin_weight">0.000 g</span>
-                                    </div>
-                                    <div class="summary-row">
-                                        <span class="summary-label">Total Net Weight:</span>
-                                        <span class="summary-value" id="total_net_weight"><?php echo number_format((float)$original_loan['net_weight'], 3); ?> g</span>
-                                    </div>
-                                    <div class="summary-row">
-                                        <span class="summary-label">Original Loan Amount:</span>
-                                        <span class="summary-value" style="color: #718096;">₹ <?php echo number_format((float)$original_loan['loan_amount'], 2); ?></span>
-                                    </div>
-                                    <div class="summary-row" style="border-top: 2px solid #667eea30; margin-top: 10px; padding-top: 10px;">
-                                        <span class="summary-label">New Product Value:</span>
-                                        <span class="summary-value" style="color: #667eea;">₹ <?php echo number_format($new_product_value, 2); ?></span>
-                                    </div>
-                                    <div class="summary-row">
-                                        <span class="summary-label">Loan Percentage:</span>
-                                        <span class="summary-value"><?php echo (int)$current_loan_percentage; ?>%</span>
-                                    </div>
-                                </div>
-
-                                <!-- Hidden fields for totals -->
-                                <input type="hidden" name="gross_weight" id="gross_weight" value="<?php echo (float)$original_loan['gross_weight']; ?>">
-                                <input type="hidden" name="net_weight" id="net_weight" value="<?php echo (float)$original_loan['net_weight']; ?>">
-                                <input type="hidden" name="product_value" id="product_value" value="<?php echo (float)$new_product_value; ?>">
-                                <input type="hidden" name="max_value" id="max_value" value="<?php echo (float)$new_max_value; ?>">
-                                
-                                <div class="form-grid" style="margin-top: 20px;">
-                                    <div class="form-group">
-                                        <label class="form-label">Process Charge (₹)</label>
-                                        <input type="number" class="form-control" name="process_charge" id="process_charge" value="0.00" step="0.01" min="0">
-                                    </div>
-                                    <div class="form-group">
-                                        <label class="form-label">Appraisal Charge (₹)</label>
-                                        <input type="number" class="form-control" name="appraisal_charge" id="appraisal_charge" value="0.00" step="0.01" min="0">
-                                    </div>
-                                </div>
-                            </div>
+                            
 
                             <!-- Email Notification Option -->
                             <div class="form-card">
@@ -2489,31 +2295,32 @@ function safeEscape($value) {
                     <div class="recent-loans">
                         <h3>Recent Reloans</h3>
                         <div class="recent-loans-table">
-                            <table>
-                                <thead>
-                                    <tr>
-                                        <th>Receipt No</th>
-                                        <th>Customer</th>
-                                        <th>Amount</th>
-                                        <th>Date</th>
-                                        <th>Days</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php while($reloan = mysqli_fetch_assoc($recent_reloans_result)): ?>
-                                    <tr onclick="window.location.href='view-loan.php?id=<?php echo (int)$reloan['id']; ?>'">
-                                        <td>
-                                            <?php echo safeEscape($reloan['receipt_number']); ?>
-                                            <span class="reloan-badge-small">Reloan</span>
-                                        </td>
-                                        <td><?php echo safeEscape($reloan['customer_name']); ?></td>
-                                        <td>₹ <?php echo number_format((float)$reloan['loan_amount'], 2); ?></td>
-                                        <td><?php echo date('d/m/Y', strtotime($reloan['created_at'])); ?></td>
-                                        <td><?php echo (int)$reloan['days_old']; ?> days</td>
-                                    </tr>
-                                    <?php endwhile; ?>
-                                </tbody>
-                            </table>
+                            <div class="table-responsive">
+                                <table class="table">
+                                    <thead>
+                                        2
+                                            <th>Receipt No</th>
+                                            <th>Customer</th>
+                                            <th>Amount</th>
+                                            <th>Date</th>
+                                            <th>Days</th>
+                                        </thead>
+                                    <tbody>
+                                        <?php while($reloan = mysqli_fetch_assoc($recent_reloans_result)): ?>
+                                        <tr onclick="window.location.href='view-loan.php?id=<?php echo (int)$reloan['id']; ?>'">
+                                            2
+                                                <?php echo safeEscape($reloan['receipt_number']); ?>
+                                                <span class="reloan-badge-small">Reloan</span>
+                                            2
+                                            2<?php echo safeEscape($reloan['customer_name']); ?>2
+                                            2₹ <?php echo number_format((float)$reloan['loan_amount'], 2); ?>2
+                                            2<?php echo date('d/m/Y', strtotime($reloan['created_at'])); ?>2
+                                            2<?php echo (int)$reloan['days_old']; ?> days2
+                                        2
+                                        <?php endwhile; ?>
+                                    </tbody>
+                                2
+                            </div>
                         </div>
                     </div>
                     <?php endif; ?>
@@ -2620,7 +2427,7 @@ function safeEscape($value) {
             document.getElementById('net_weight').value = totalNet.toFixed(3);
             
             const valuePerGram = <?php echo (float)($current_value_per_gram ?? 10000); ?>;
-            const loanPercentage = <?php echo (float)($current_loan_percentage ?? 75); ?>;
+            const loanPercentage = <?php echo (float)($current_loan_percentage ?? 70); ?>;
             
             const newProductValue = totalNet * valuePerGram;
             const newCalculatedAmount = (newProductValue * loanPercentage) / 100;
@@ -2660,18 +2467,15 @@ function safeEscape($value) {
             
             if (paymentMethod === 'bank' && currentBankBalance > 0) {
                 if (loanAmount > currentBankBalance) {
-                    balanceWarning.style.display = 'flex';
-                    submitBtn.disabled = true;
-                    submitBtn.title = 'Insufficient bank balance';
+                    if (balanceWarning) balanceWarning.style.display = 'flex';
+                    if (submitBtn) submitBtn.disabled = true;
                 } else {
-                    balanceWarning.style.display = 'none';
-                    submitBtn.disabled = false;
-                    submitBtn.title = '';
+                    if (balanceWarning) balanceWarning.style.display = 'none';
+                    if (submitBtn) submitBtn.disabled = false;
                 }
             } else {
-                balanceWarning.style.display = 'none';
-                submitBtn.disabled = false;
-                submitBtn.title = '';
+                if (balanceWarning) balanceWarning.style.display = 'none';
+                if (submitBtn) submitBtn.disabled = false;
             }
         }
 
@@ -2686,11 +2490,11 @@ function safeEscape($value) {
             
             const bankDetails = document.getElementById('bankDetails');
             if (method === 'bank') {
-                bankDetails.classList.add('show');
+                if (bankDetails) bankDetails.classList.add('show');
                 validateBankBalance();
             } else {
-                bankDetails.classList.remove('show');
-                document.getElementById('submitBtn').disabled = false;
+                if (bankDetails) bankDetails.classList.remove('show');
+                if (document.getElementById('submitBtn')) document.getElementById('submitBtn').disabled = false;
             }
         }
 
@@ -2701,45 +2505,57 @@ function safeEscape($value) {
             
             if (bankOption) {
                 const balance = bankOption.getAttribute('data-balance') || 0;
-                document.getElementById('bankBalanceAmount').textContent = '₹ ' + parseFloat(balance).toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('bankBalanceDisplay').style.display = 'flex';
+                const bankBalanceAmount = document.getElementById('bankBalanceAmount');
+                if (bankBalanceAmount) bankBalanceAmount.textContent = '₹ ' + parseFloat(balance).toLocaleString(undefined, {minimumFractionDigits: 2});
+                const bankBalanceDisplay = document.getElementById('bankBalanceDisplay');
+                if (bankBalanceDisplay) bankBalanceDisplay.style.display = 'flex';
             } else {
-                document.getElementById('bankBalanceDisplay').style.display = 'none';
+                const bankBalanceDisplay = document.getElementById('bankBalanceDisplay');
+                if (bankBalanceDisplay) bankBalanceDisplay.style.display = 'none';
             }
             
             const accountSelect = document.getElementById('bank_account_id');
-            Array.from(accountSelect.options).forEach(option => {
-                if (option.value === '') return;
-                const optionBankId = option.getAttribute('data-bank-id');
-                if (bankId === '' || optionBankId === bankId) {
-                    option.style.display = '';
-                } else {
-                    option.style.display = 'none';
-                }
-            });
+            if (accountSelect) {
+                Array.from(accountSelect.options).forEach(option => {
+                    if (option.value === '') return;
+                    const optionBankId = option.getAttribute('data-bank-id');
+                    if (bankId === '' || optionBankId === bankId) {
+                        option.style.display = '';
+                    } else {
+                        option.style.display = 'none';
+                    }
+                });
+            }
             
-            document.getElementById('accountBalanceDisplay').style.display = 'none';
-            document.getElementById('balanceWarning').style.display = 'none';
+            const accountBalanceDisplay = document.getElementById('accountBalanceDisplay');
+            if (accountBalanceDisplay) accountBalanceDisplay.style.display = 'none';
+            const balanceWarning = document.getElementById('balanceWarning');
+            if (balanceWarning) balanceWarning.style.display = 'none';
             currentBankBalance = 0;
         }
 
         function showAccountBalance() {
             const accountSelect = document.getElementById('bank_account_id');
-            const selectedOption = accountSelect.options[accountSelect.selectedIndex];
+            const selectedOption = accountSelect ? accountSelect.options[accountSelect.selectedIndex] : null;
             
             if (selectedOption && selectedOption.value !== '') {
                 const balance = parseFloat(selectedOption.getAttribute('data-balance')) || 0;
                 currentBankBalance = balance;
                 
-                document.getElementById('accountBalanceAmount').textContent = '₹ ' + balance.toLocaleString(undefined, {minimumFractionDigits: 2});
-                document.getElementById('accountBalanceDisplay').style.display = 'flex';
+                const accountBalanceAmount = document.getElementById('accountBalanceAmount');
+                if (accountBalanceAmount) accountBalanceAmount.textContent = '₹ ' + balance.toLocaleString(undefined, {minimumFractionDigits: 2});
+                const accountBalanceDisplay = document.getElementById('accountBalanceDisplay');
+                if (accountBalanceDisplay) accountBalanceDisplay.style.display = 'flex';
                 
                 validateBankBalance();
             } else {
-                document.getElementById('accountBalanceDisplay').style.display = 'none';
-                document.getElementById('balanceWarning').style.display = 'none';
+                const accountBalanceDisplay = document.getElementById('accountBalanceDisplay');
+                if (accountBalanceDisplay) accountBalanceDisplay.style.display = 'none';
+                const balanceWarning = document.getElementById('balanceWarning');
+                if (balanceWarning) balanceWarning.style.display = 'none';
                 currentBankBalance = 0;
-                document.getElementById('submitBtn').disabled = false;
+                const submitBtn = document.getElementById('submitBtn');
+                if (submitBtn) submitBtn.disabled = false;
             }
         }
 
@@ -2748,7 +2564,8 @@ function safeEscape($value) {
             currentJewelRow = button.closest('tr');
             currentRowNum = rowNum;
             
-            document.getElementById('cameraModal').style.display = 'flex';
+            const cameraModal = document.getElementById('cameraModal');
+            if (cameraModal) cameraModal.style.display = 'flex';
             
             startCamera();
         }
@@ -2762,7 +2579,7 @@ function safeEscape($value) {
                 
                 cameraStream = await navigator.mediaDevices.getUserMedia(constraints);
                 const video = document.getElementById('cameraVideo');
-                video.srcObject = cameraStream;
+                if (video) video.srcObject = cameraStream;
             } catch (err) {
                 console.error('Camera error:', err);
                 Swal.fire('Error', 'Unable to access camera: ' + err.message, 'error');
@@ -2782,6 +2599,8 @@ function safeEscape($value) {
             const video = document.getElementById('cameraVideo');
             const canvas = document.getElementById('cameraCanvas');
             
+            if (!video || !canvas) return;
+            
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             
@@ -2791,6 +2610,7 @@ function safeEscape($value) {
             const imageData = canvas.toDataURL('image/jpeg', 0.8);
             
             const row = currentJewelRow;
+            if (!row) return;
             
             const hiddenInput = row.querySelector('input[type="hidden"]');
             if (hiddenInput) {
@@ -2798,9 +2618,11 @@ function safeEscape($value) {
             }
             
             const previewContainer = row.querySelector('.photo-preview-container');
-            const previewImg = previewContainer.querySelector('img');
-            previewImg.src = imageData;
-            previewContainer.style.display = 'block';
+            if (previewContainer) {
+                const previewImg = previewContainer.querySelector('img');
+                if (previewImg) previewImg.src = imageData;
+                previewContainer.style.display = 'block';
+            }
             
             const fileInput = row.querySelector('input[type="file"]');
             if (fileInput) fileInput.value = '';
@@ -2818,7 +2640,8 @@ function safeEscape($value) {
                 cameraStream.getTracks().forEach(track => track.stop());
                 cameraStream = null;
             }
-            document.getElementById('cameraModal').style.display = 'none';
+            const cameraModal = document.getElementById('cameraModal');
+            if (cameraModal) cameraModal.style.display = 'none';
         }
 
         function previewJewelPhoto(input, rowNum) {
@@ -2839,10 +2662,13 @@ function safeEscape($value) {
                 const row = input.closest('tr');
                 
                 reader.onload = function(e) {
+                    if (!row) return;
                     const previewContainer = row.querySelector('.photo-preview-container');
-                    const previewImg = previewContainer.querySelector('img');
-                    previewImg.src = e.target.result;
-                    previewContainer.style.display = 'block';
+                    if (previewContainer) {
+                        const previewImg = previewContainer.querySelector('img');
+                        if (previewImg) previewImg.src = e.target.result;
+                        previewContainer.style.display = 'block';
+                    }
                     
                     const hiddenInput = row.querySelector('input[type="hidden"]');
                     if (hiddenInput) hiddenInput.value = '';
@@ -2858,45 +2684,50 @@ function safeEscape($value) {
         }
 
         // Form submission validation
-        document.getElementById('reloanForm')?.addEventListener('submit', function(e) {
-            const paymentMethod = document.getElementById('payment_method').value;
-            const loanAmount = parseFloat(document.getElementById('loan_amount').value) || 0;
-            
-            if (paymentMethod === 'bank') {
-                if (currentBankBalance <= 0) {
-                    e.preventDefault();
-                    Swal.fire('Error', 'Please select a bank account', 'error');
-                    return;
+        const reloanForm = document.getElementById('reloanForm');
+        if (reloanForm) {
+            reloanForm.addEventListener('submit', function(e) {
+                const paymentMethod = document.getElementById('payment_method').value;
+                const loanAmount = parseFloat(document.getElementById('loan_amount').value) || 0;
+                
+                if (paymentMethod === 'bank') {
+                    if (currentBankBalance <= 0) {
+                        e.preventDefault();
+                        Swal.fire('Error', 'Please select a bank account', 'error');
+                        return false;
+                    }
+                    
+                    if (loanAmount > currentBankBalance) {
+                        e.preventDefault();
+                        Swal.fire('Error', 'Insufficient bank balance! Available: ₹' + currentBankBalance.toLocaleString(), 'error');
+                        return false;
+                    }
                 }
                 
-                if (loanAmount > currentBankBalance) {
-                    e.preventDefault();
-                    Swal.fire('Error', 'Insufficient bank balance! Available: ₹' + currentBankBalance.toLocaleString(), 'error');
-                    return;
-                }
-            }
-            
-            return Swal.fire({
-                title: 'Create Reloan?',
-                html: `You are creating a new loan of <strong>₹${loanAmount.toLocaleString()}</strong><br>
-                       Original loan amount was ₹${<?php echo (float)($original_loan['loan_amount'] ?? 0); ?>}<br>
-                       This will create a NEW loan while keeping the original loan active.`,
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonColor: '#48bb78',
-                cancelButtonColor: '#f56565',
-                confirmButtonText: 'Yes, create reloan',
-                cancelButtonText: 'Cancel'
-            }).then((result) => {
-                if (!result.isConfirmed) {
-                    e.preventDefault();
-                }
+                Swal.fire({
+                    title: 'Create Reloan?',
+                    html: `You are creating a new loan of <strong>₹${loanAmount.toLocaleString()}</strong><br>
+                           Original loan amount was ₹${<?php echo (float)($original_loan['loan_amount'] ?? 0); ?>}<br>
+                           This will create a NEW loan while keeping the original loan active.`,
+                    icon: 'question',
+                    showCancelButton: true,
+                    confirmButtonColor: '#48bb78',
+                    cancelButtonColor: '#f56565',
+                    confirmButtonText: 'Yes, create reloan',
+                    cancelButtonText: 'Cancel'
+                }).then((result) => {
+                    if (!result.isConfirmed) {
+                        e.preventDefault();
+                    }
+                });
             });
-        });
+        }
 
         // Auto-hide alerts
         setTimeout(function() {
-            document.querySelectorAll('.alert').forEach(alert => alert.style.display = 'none');
+            document.querySelectorAll('.alert').forEach(alert => {
+                alert.style.display = 'none';
+            });
         }, 5000);
 
         // Initialize on page load

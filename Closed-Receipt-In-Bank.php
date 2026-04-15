@@ -18,6 +18,117 @@ if (!in_array($_SESSION['user_role'], ['admin', 'manager', 'sale'])) {
 $message = '';
 $error = '';
 
+
+$selfPage = basename($_SERVER['PHP_SELF']);
+
+// ============== AJAX HANDLER - VIEW RECEIPT DETAILS ==============
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'get_receipt_details') {
+    header('Content-Type: application/json');
+
+    $loan_id = intval($_GET['loan_id'] ?? 0);
+
+    if ($loan_id <= 0) {
+        echo json_encode(['success' => false, 'message' => 'Invalid loan id']);
+        exit();
+    }
+
+    $loan_query = "SELECT bl.*,
+                   b.bank_short_name, b.bank_full_name,
+                   ba.account_holder_no, ba.bank_account_no,
+                   c.customer_name, c.mobile_number, c.email,
+                   u.name AS employee_name
+                   FROM bank_loans bl
+                   LEFT JOIN bank_master b ON bl.bank_id = b.id
+                   LEFT JOIN bank_accounts ba ON bl.bank_account_id = ba.id
+                   LEFT JOIN customers c ON bl.customer_id = c.id
+                   LEFT JOIN users u ON bl.employee_id = u.id
+                   WHERE bl.id = ? LIMIT 1";
+
+    $loan_stmt = mysqli_prepare($conn, $loan_query);
+    if (!$loan_stmt) {
+        echo json_encode(['success' => false, 'message' => 'Unable to prepare loan query']);
+        exit();
+    }
+
+    mysqli_stmt_bind_param($loan_stmt, 'i', $loan_id);
+    mysqli_stmt_execute($loan_stmt);
+    $loan_result = mysqli_stmt_get_result($loan_stmt);
+    $loan = mysqli_fetch_assoc($loan_result);
+    mysqli_stmt_close($loan_stmt);
+
+    if (!$loan) {
+        echo json_encode(['success' => false, 'message' => 'Receipt not found']);
+        exit();
+    }
+
+    $items = [];
+    $items_stmt = mysqli_prepare($conn, "SELECT id, jewel_name, karat, defect_details, stone_details, net_weight, quantity, photo_path FROM bank_loan_items WHERE bank_loan_id = ? ORDER BY id ASC");
+    if ($items_stmt) {
+        mysqli_stmt_bind_param($items_stmt, 'i', $loan_id);
+        mysqli_stmt_execute($items_stmt);
+        $items_result = mysqli_stmt_get_result($items_stmt);
+        while ($item = mysqli_fetch_assoc($items_result)) {
+            $items[] = [
+                'id' => (int)$item['id'],
+                'jewel_name' => $item['jewel_name'] ?? '',
+                'karat' => (float)($item['karat'] ?? 0),
+                'defect_details' => $item['defect_details'] ?? '',
+                'stone_details' => $item['stone_details'] ?? '',
+                'net_weight' => (float)($item['net_weight'] ?? 0),
+                'quantity' => (int)($item['quantity'] ?? 0),
+                'photo_path' => $item['photo_path'] ?? ''
+            ];
+        }
+        mysqli_stmt_close($items_stmt);
+    }
+
+    $payments = [];
+    $payments_stmt = mysqli_prepare($conn, "SELECT id, payment_date, payment_amount, payment_method, receipt_number, remarks FROM bank_loan_payments WHERE bank_loan_id = ? ORDER BY payment_date DESC, id DESC");
+    if ($payments_stmt) {
+        mysqli_stmt_bind_param($payments_stmt, 'i', $loan_id);
+        mysqli_stmt_execute($payments_stmt);
+        $payments_result = mysqli_stmt_get_result($payments_stmt);
+        while ($payment = mysqli_fetch_assoc($payments_result)) {
+            $payments[] = [
+                'id' => (int)$payment['id'],
+                'payment_date' => !empty($payment['payment_date']) ? date('d-m-Y', strtotime($payment['payment_date'])) : '',
+                'payment_amount' => (float)($payment['payment_amount'] ?? 0),
+                'payment_method' => ucfirst((string)($payment['payment_method'] ?? 'cash')),
+                'receipt_number' => $payment['receipt_number'] ?? '',
+                'remarks' => $payment['remarks'] ?? ''
+            ];
+        }
+        mysqli_stmt_close($payments_stmt);
+    }
+
+    echo json_encode([
+        'success' => true,
+        'loan' => [
+            'id' => (int)$loan['id'],
+            'loan_reference' => $loan['loan_reference'] ?? '',
+            'loan_date' => !empty($loan['loan_date']) ? date('d-m-Y', strtotime($loan['loan_date'])) : '',
+            'close_date' => !empty($loan['close_date']) ? date('d-m-Y', strtotime($loan['close_date'])) : '',
+            'loan_amount' => (float)($loan['loan_amount'] ?? 0),
+            'interest_rate' => (float)($loan['interest_rate'] ?? 0),
+            'total_interest' => (float)($loan['total_interest'] ?? 0),
+            'document_charge' => (float)($loan['document_charge'] ?? 0),
+            'processing_fee' => (float)($loan['processing_fee'] ?? 0),
+            'total_payable' => (float)($loan['total_payable'] ?? 0),
+            'remarks' => $loan['remarks'] ?? '',
+            'bank_short_name' => $loan['bank_short_name'] ?? '',
+            'bank_full_name' => $loan['bank_full_name'] ?? '',
+            'customer_name' => $loan['customer_name'] ?? '',
+            'mobile_number' => $loan['mobile_number'] ?? '',
+            'email' => $loan['email'] ?? ''
+        ],
+        'items' => $items,
+        'payments' => $payments
+    ]);
+    exit();
+}
+// ============== END AJAX HANDLER ==============
+
+
 // Handle date filter submission
 $from_date = isset($_GET['from_date']) ? $_GET['from_date'] : date('Y-m-01');
 $to_date = isset($_GET['to_date']) ? $_GET['to_date'] : date('Y-m-d');
@@ -1222,7 +1333,7 @@ $bankwise_result = mysqli_query($conn, $bankwise_query);
             document.getElementById('receiptModal').classList.add('active');
             
             // Load receipt details via AJAX
-            fetch('ajax/get_bank_loan_details.php?loan_id=' + loanId)
+            fetch('<?php echo $selfPage; ?>?ajax=get_receipt_details&loan_id=' + loanId)
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
@@ -1249,7 +1360,7 @@ $bankwise_result = mysqli_query($conn, $bankwise_query);
 
         // Download receipt
         function downloadReceipt(loanId) {
-            window.open('download_bank_receipt.php?loan_id=' + loanId, '_blank');
+            window.open('print_bank_receipt.php?loan_id=' + loanId + '&download=1', '_blank');
         }
 
         // Close modal when clicking outside

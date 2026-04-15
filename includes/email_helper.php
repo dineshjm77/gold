@@ -1045,7 +1045,146 @@ function sendLoanClosureConfirmationEmail($details, $conn) {
     return $result['success'];
 }
 
-
+/**
+ * Send Bulk Loan Closure Confirmation Email
+ */
+function sendBulkLoanClosureConfirmationEmail($details, $conn) {
+    global $phpmailer_loaded;
+    
+    if (!EMAIL_ENABLED || !$phpmailer_loaded || empty($details['customer_email'])) {
+        error_log("Bulk loan closure confirmation email not sent");
+        return false;
+    }
+    
+    $company_query = "SELECT * FROM branches WHERE id = 1 LIMIT 1";
+    $company_result = mysqli_query($conn, $company_query);
+    $company = mysqli_fetch_assoc($company_result);
+    
+    if (!$company) {
+        $company = [
+            'branch_name' => 'WEALTHROT',
+            'address' => 'Main Branch',
+            'phone' => '',
+            'email' => FROM_EMAIL,
+            'logo_path' => ''
+        ];
+    }
+    
+    $subject = "🎉 Bulk Loan Closure Completed - " . $details['loans_closed'] . " Loans Closed";
+    
+    // Build loans HTML
+    $loans_html = '';
+    $total_principal = 0;
+    $total_interest = 0;
+    
+    foreach ($details['loans_details'] as $loan) {
+        $total_principal += $loan['payable_principal'];
+        $total_interest += $loan['payable_interest'];
+        
+        $loans_html .= "
+         <tr>
+            <td style='padding: 8px; border-bottom: 1px solid #e2e8f0;'>" . htmlspecialchars($loan['receipt_number']) . "</td>
+            <td style='padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: right;'>₹ " . number_format($loan['payable_principal'], 2) . "</td>
+            <td style='padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: right;'>₹ " . number_format($loan['payable_interest'], 2) . "</td>
+            <td style='padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: right;'>₹ " . number_format($loan['total_amount'], 2) . "</td>
+         </tr>
+        ";
+    }
+    
+    $body = "
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset='UTF-8'>
+        <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+        <title>Bulk Loan Closure Confirmation</title>
+        <style>
+            body { font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background: linear-gradient(135deg, #48bb78 0%, #38a169 100%); }
+            .container { max-width: 700px; margin: 20px auto; background: white; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); overflow: hidden; }
+            .header { background: linear-gradient(135deg, #48bb78 0%, #38a169 100%); color: white; padding: 30px; text-align: center; }
+            .header h1 { margin: 0; font-size: 28px; }
+            .content { padding: 30px; }
+            .success-box { background: #c6f6d5; border: 2px solid #48bb78; border-radius: 12px; padding: 20px; text-align: center; margin: 20px 0; }
+            .details-table { width: 100%; border-collapse: collapse; margin: 20px 0; background: #f7fafc; border-radius: 12px; overflow: hidden; }
+            .details-table th { background: #48bb78; color: white; padding: 12px; text-align: left; }
+            .details-table td { padding: 10px 12px; border-bottom: 1px solid #e2e8f0; }
+            .loans-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+            .loans-table th { background: #667eea; color: white; padding: 10px; text-align: left; font-size: 13px; }
+            .summary-box { background: #ebf8ff; padding: 15px; border-radius: 12px; margin: 20px 0; }
+            .summary-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #cbd5e0; }
+            .summary-total { font-weight: bold; font-size: 18px; color: #48bb78; margin-top: 10px; padding-top: 10px; border-top: 2px solid #48bb78; }
+            .footer { text-align: center; padding: 30px; background: #f7fafc; font-size: 13px; color: #718096; border-top: 1px solid #e2e8f0; }
+        </style>
+    </head>
+    <body>
+        <div class='container'>
+            <div class='header'>
+                <h1>Bulk Loan Closure Completed! 🎉</h1>
+                <p>" . $details['loans_closed'] . " loans closed successfully</p>
+            </div>
+            <div class='content'>
+                <div class='success-box'>
+                    <h3 style='color:#22543d;'>✓ ALL LOANS CLOSED & JEWELRY RETURNED</h3>
+                    <p style='color:#22543d;'>All your loans have been successfully closed and jewelry returned.</p>
+                </div>
+                
+                <p>Dear <strong>" . htmlspecialchars($details['customer_name']) . "</strong>,</p>
+                <p>We are pleased to inform you that all your loans have been successfully closed. Your jewelry has been returned to you.</p>
+                
+                <table class='details-table'>
+                    <thead> <tr><th colspan='2'>Bulk Closure Details</th></tr> </thead>
+                    <tbody>
+                         <tr><td><strong>Bulk Receipt</strong></td><td>" . htmlspecialchars($details['bulk_receipt']) . "</td></tr>
+                         <tr><td><strong>Closure Date</strong></td><td>" . date('d-m-Y', strtotime($details['close_date'])) . "</td></tr>
+                         <tr><td><strong>Number of Loans</strong></td><td>" . $details['loans_closed'] . "</td></tr>
+                         <tr><td><strong>Payment Mode</strong></td><td>" . strtoupper($details['payment_mode']) . "</td></tr>
+                    </tbody>
+                </table>
+                
+                <h4 style='margin: 20px 0 10px;'>📋 Loans Closed</h4>
+                <table class='loans-table'>
+                    <thead>
+                         <tr>
+                            <th>Receipt Number</th>
+                            <th>Principal Paid</th>
+                            <th>Interest Paid</th>
+                            <th>Total</th>
+                         </tr>
+                    </thead>
+                    <tbody>{$loans_html}</tbody>
+                    <tfoot>
+                         <tr style='background: #f7fafc; font-weight: bold;'>
+                            <td><strong>TOTAL</strong></td>
+                            <td><strong>₹ " . number_format($total_principal, 2) . "</strong></td>
+                            <td><strong>₹ " . number_format($total_interest, 2) . "</strong></td>
+                            <td><strong>₹ " . number_format($details['total_amount'], 2) . "</strong></td>
+                         </tr>
+                    </tfoot>
+                </table>
+                
+                <div class='summary-box'>
+                    <div class='summary-row'><span>Sub Total:</span><span>₹ " . number_format($details['total_amount'] + $details['discount'] - $details['round_off'], 2) . "</span></div>
+                    " . ($details['discount'] > 0 ? "<div class='summary-row'><span>Discount:</span><span>- ₹ " . number_format($details['discount'], 2) . "</span></div>" : "") . "
+                    " . ($details['round_off'] != 0 ? "<div class='summary-row'><span>Round Off:</span><span>₹ " . number_format($details['round_off'], 2) . "</span></div>" : "") . "
+                    " . ($details['d_namuna'] ? "<div class='summary-row'><span>D. Namuna:</span><span>✓ Included</span></div>" : "") . "
+                    " . ($details['others'] ? "<div class='summary-row'><span>Others:</span><span>✓ Included</span></div>" : "") . "
+                    <div class='summary-total'><span>Total Amount Paid:</span><span>₹ " . number_format($details['total_amount'], 2) . "</span></div>
+                </div>
+                
+                <p><strong>Thank you for your business!</strong> We look forward to serving you again.</p>
+            </div>
+            <div class='footer'>
+                <p><strong>" . htmlspecialchars($company['branch_name']) . "</strong></p>
+                <p>© " . date('Y') . " WEALTHROT. All rights reserved.</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    ";
+    
+    $result = sendEmailPHPMailer($details['customer_email'], $subject, $body, ['id' => 0, 'receipt_number' => $details['bulk_receipt']], $conn);
+    return $result['success'];
+}
 
 
 

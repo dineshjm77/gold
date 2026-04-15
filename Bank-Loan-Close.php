@@ -5,14 +5,35 @@ $pageTitle = 'Bank Loan Closure';
 require_once 'includes/db.php';
 require_once 'auth_check.php';
 
+$selfPage = basename($_SERVER['PHP_SELF']);
+$bankLoanPage = 'Bank-Loan.php';
+
 // Enable error reporting for debugging (remove in production)
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
 // Check if user has permission
-if (!in_array($_SESSION['user_role'], ['admin', 'manager'])) {
+if (!in_array($_SESSION['user_role'], ['admin', 'sale', 'manager'])) {
     header('Location: index.php');
     exit();
+}
+
+// Ensure bank_loan_emi status supports 'closed' and bank_loan_payments.emi_id can store closure entries
+$emiStatusColumn = mysqli_query($conn, "SHOW COLUMNS FROM bank_loan_emi LIKE 'status'");
+if ($emiStatusColumn && mysqli_num_rows($emiStatusColumn) > 0) {
+    $emiStatusData = mysqli_fetch_assoc($emiStatusColumn);
+    $emiStatusType = strtolower($emiStatusData['Type'] ?? '');
+    if (strpos($emiStatusType, "'closed'") === false) {
+        @mysqli_query($conn, "ALTER TABLE bank_loan_emi MODIFY status ENUM('pending','paid','overdue','closed') DEFAULT 'pending'");
+    }
+}
+
+$emiIdColumn = mysqli_query($conn, "SHOW COLUMNS FROM bank_loan_payments LIKE 'emi_id'");
+if ($emiIdColumn && mysqli_num_rows($emiIdColumn) > 0) {
+    $emiIdData = mysqli_fetch_assoc($emiIdColumn);
+    if (strtoupper((string)($emiIdData['Null'] ?? 'NO')) !== 'YES') {
+        @mysqli_query($conn, "ALTER TABLE bank_loan_payments MODIFY emi_id INT(11) NULL");
+    }
 }
 
 $message = '';
@@ -214,14 +235,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             $receipt_no = 'CLS-' . date('Ymd') . '-' . str_pad($receipt_count, 4, '0', STR_PAD_LEFT);
             
             // Create closure payment record
+            $closure_emi_id = 0;
             $payment_query = "INSERT INTO bank_loan_payments (
-                bank_loan_id, payment_date, payment_amount, payment_method, 
+                bank_loan_id, emi_id, payment_date, payment_amount, payment_method, 
                 receipt_number, employee_id, remarks
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)";
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
             
             $payment_stmt = mysqli_prepare($conn, $payment_query);
-            mysqli_stmt_bind_param($payment_stmt, 'isdssis', 
-                $loan_id, $closure_date, $closure_amount, $payment_method, 
+            mysqli_stmt_bind_param($payment_stmt, 'iisdssis', 
+                $loan_id, $closure_emi_id, $closure_date, $closure_amount, $payment_method, 
                 $receipt_no, $_SESSION['user_id'], $remarks
             );
             
@@ -260,7 +282,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
             mysqli_commit($conn);
             
             // Redirect with success message
-            header('Location: bank-loan-close.php?success=closed&ref=' . urlencode($loan['loan_reference']) . '&receipt=' . urlencode($receipt_no));
+            header('Location: ' . $selfPage . '?success=closed&ref=' . urlencode($loan['loan_reference']) . '&receipt=' . urlencode($receipt_no));
             exit();
             
         } catch (Exception $e) {
@@ -1106,6 +1128,15 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
                         </div>
 
                         <div class="form-group">
+                            <label class="form-label">Live Search Loan</label>
+                            <div class="input-group">
+                                <i class="bi bi-search input-icon"></i>
+                                <input type="text" class="form-control" id="loanSearchInput" placeholder="Type loan ref, customer, mobile, amount..." style="padding-left: 40px;">
+                            </div>
+                            <small class="form-text">Live filter by Loan Ref, Customer, Mobile, Amount, or EMI progress</small>
+                        </div>
+
+                        <div class="form-group">
                             <label class="form-label required">Select Active Loan</label>
                             <select class="form-select" id="loanSelect" style="width: 100%;" required>
                                 <option value="">Search by loan reference or customer name...</option>
@@ -1114,8 +1145,17 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
                                     mysqli_data_seek($loans_result, 0);
                                     while($loan = mysqli_fetch_assoc($loans_result)): 
                                         $progress = $loan['total_emis'] > 0 ? round(($loan['paid_emis'] / $loan['total_emis']) * 100) : 0;
+                                        $search_blob = strtolower(
+                                            trim(
+                                                $loan['loan_reference'] . ' ' .
+                                                $loan['customer_name'] . ' ' .
+                                                ($loan['mobile_number'] ?? '') . ' ' .
+                                                number_format((float)$loan['loan_amount'], 2, '.', '') . ' ' .
+                                                $loan['paid_emis'] . '/' . $loan['total_emis'] . ' emis'
+                                            )
+                                        );
                                 ?>
-                                    <option value="<?php echo $loan['id']; ?>">
+                                    <option value="<?php echo $loan['id']; ?>" data-search="<?php echo htmlspecialchars($search_blob, ENT_QUOTES, 'UTF-8'); ?>">
                                         #<?php echo $loan['loan_reference']; ?> - <?php echo htmlspecialchars($loan['customer_name']); ?> 
                                         (₹<?php echo number_format($loan['loan_amount'], 0); ?>, 
                                          <?php echo $loan['paid_emis']; ?>/<?php echo $loan['total_emis']; ?> EMIs)
@@ -1128,6 +1168,8 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
                                 ?>
                             </select>
                             <small class="form-text">Select a loan to view closure details</small>
+                            <div id="loanSearchMeta" style="margin-top: 8px; font-size: 12px; color: #718096;">Showing 0 loans</div>
+                            <div id="loanNoResults" style="display:none; margin-top: 8px; font-size: 13px; color: #e53e3e;">No matching active loans found.</div>
                         </div>
                     </div>
 
@@ -1419,29 +1461,120 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
             maxDate: "today"
         });
 
-        // Initialize Select2
-        $(document).ready(function() {
+        let currentLoanData = null;
+        let originalLoanOptions = [];
+
+        function initializeLoanSelect2() {
+            if (typeof jQuery === 'undefined' || typeof $.fn.select2 === 'undefined') {
+                return;
+            }
+
+            if ($('#loanSelect').hasClass('select2-hidden-accessible')) {
+                $('#loanSelect').select2('destroy');
+            }
+
             $('#loanSelect').select2({
                 placeholder: 'Search by loan reference or customer name...',
                 allowClear: true,
-                width: '100%'
+                width: '100%',
+                matcher: function(params, data) {
+                    if ($.trim(params.term) === '') {
+                        return data;
+                    }
+
+                    if (typeof data.text === 'undefined') {
+                        return null;
+                    }
+
+                    const term = params.term.toLowerCase();
+                    const dataSearch = data.element && data.element.dataset ? (data.element.dataset.search || '') : '';
+                    const text = (data.text || '').toLowerCase();
+
+                    if (text.indexOf(term) > -1 || dataSearch.toLowerCase().indexOf(term) > -1) {
+                        return data;
+                    }
+
+                    return null;
+                }
             });
-        });
+        }
 
-        let currentLoanData = null;
+        function buildOriginalLoanOptions() {
+            const loanSelect = document.getElementById('loanSelect');
+            originalLoanOptions = [];
 
-        // Handle loan selection
-        document.getElementById('loanSelect').addEventListener('change', function() {
-            var loanId = this.value;
-            
+            Array.from(loanSelect.options).forEach(function(option) {
+                if (!option.value) {
+                    return;
+                }
+                originalLoanOptions.push({
+                    value: option.value,
+                    text: option.textContent.trim(),
+                    search: (option.dataset.search || option.textContent || '').toLowerCase()
+                });
+            });
+        }
+
+        function updateLoanSearchMeta(matchedCount) {
+            const meta = document.getElementById('loanSearchMeta');
+            const noResults = document.getElementById('loanNoResults');
+            const totalCount = originalLoanOptions.length;
+
+            if (meta) {
+                meta.textContent = 'Showing ' + matchedCount + ' of ' + totalCount + ' loans';
+            }
+
+            if (noResults) {
+                noResults.style.display = matchedCount === 0 ? 'block' : 'none';
+            }
+        }
+
+        function filterLoanOptions() {
+            const loanSelect = document.getElementById('loanSelect');
+            const searchInput = document.getElementById('loanSearchInput');
+            const selectedValue = loanSelect.value;
+            const query = (searchInput.value || '').trim().toLowerCase();
+
+            loanSelect.innerHTML = '';
+
+            const placeholderOption = document.createElement('option');
+            placeholderOption.value = '';
+            placeholderOption.textContent = query ? 'Select matching loan...' : 'Search by loan reference or customer name...';
+            loanSelect.appendChild(placeholderOption);
+
+            let matchedCount = 0;
+
+            originalLoanOptions.forEach(function(item) {
+                if (!query || item.search.indexOf(query) > -1) {
+                    const option = document.createElement('option');
+                    option.value = item.value;
+                    option.textContent = item.text;
+                    option.setAttribute('data-search', item.search);
+                    loanSelect.appendChild(option);
+                    matchedCount++;
+                }
+            });
+
+            updateLoanSearchMeta(matchedCount);
+            initializeLoanSelect2();
+
+            if (selectedValue && Array.from(loanSelect.options).some(opt => opt.value === selectedValue)) {
+                loanSelect.value = selectedValue;
+                $('#loanSelect').trigger('change.select2');
+            } else {
+                loanSelect.value = '';
+                $('#loanSelect').trigger('change.select2');
+                document.getElementById('loanDetailsSection').style.display = 'none';
+            }
+        }
+
+        function fetchSelectedLoanDetails(loanId) {
             if (loanId) {
-                // Hide details section and show loading
                 document.getElementById('loanDetailsSection').style.display = 'none';
                 document.getElementById('loadingSpinner').style.display = 'block';
-                
-                // Fetch loan details
+
                 var url = window.location.href.split('?')[0] + '?ajax=get_loan_details&loan_id=' + loanId;
-                
+
                 fetch(url)
                     .then(response => {
                         if (!response.ok) {
@@ -1451,7 +1584,7 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
                     })
                     .then(data => {
                         document.getElementById('loadingSpinner').style.display = 'none';
-                        
+
                         if (data.success) {
                             displayLoanDetails(data.loan);
                         } else {
@@ -1476,6 +1609,21 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
             } else {
                 document.getElementById('loanDetailsSection').style.display = 'none';
             }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            buildOriginalLoanOptions();
+            initializeLoanSelect2();
+            updateLoanSearchMeta(originalLoanOptions.length);
+
+            const searchInput = document.getElementById('loanSearchInput');
+            if (searchInput) {
+                searchInput.addEventListener('input', filterLoanOptions);
+            }
+
+            $('#loanSelect').on('change', function() {
+                fetchSelectedLoanDetails(this.value);
+            });
         });
 
         // Display loan details
@@ -1644,6 +1792,11 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
 
         // Reset form
         function resetForm() {
+            const searchInput = document.getElementById('loanSearchInput');
+            if (searchInput) {
+                searchInput.value = '';
+            }
+            filterLoanOptions();
             $('#loanSelect').val(null).trigger('change');
             document.getElementById('loanDetailsSection').style.display = 'none';
         }
@@ -1693,7 +1846,7 @@ $closed_loans_result = mysqli_query($conn, $closed_loans_query);
                     popup: 'animate__animated animate__fadeOutUp'
                 }
             }).then((result) => {
-                window.location.href = 'bank-loan-close.php';
+                window.location.href = <?php echo json_encode($selfPage); ?>;
             });
         });
         <?php endif; ?>

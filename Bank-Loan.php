@@ -5,6 +5,9 @@ $pageTitle = 'Bank Loan Management';
 require_once 'includes/db.php';
 require_once 'auth_check.php';
 
+// Use current filename everywhere to avoid case-sensitive path issues on Linux hosting
+$selfPage = basename($_SERVER['PHP_SELF']);
+
 // Enable error reporting for debugging (remove in production)
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
@@ -85,6 +88,100 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == 'get_customer_items') {
     ]);
     exit();
 }
+
+
+if (isset($_GET['ajax']) && $_GET['ajax'] == 'get_loan_details') {
+    header('Content-Type: application/json');
+
+    $loan_id = intval($_GET['loan_id'] ?? 0);
+
+    if ($loan_id <= 0) {
+        echo json_encode(['success' => false, 'message' => 'Invalid loan ID']);
+        exit();
+    }
+
+    $loan_sql = "SELECT bl.*, 
+                        b.bank_short_name, b.bank_full_name,
+                        ba.account_holder_no, ba.bank_account_no,
+                        c.customer_name, c.mobile_number, c.aadhaar_number,
+                        u.name as employee_name
+                 FROM bank_loans bl
+                 LEFT JOIN bank_master b ON bl.bank_id = b.id
+                 LEFT JOIN bank_accounts ba ON bl.bank_account_id = ba.id
+                 LEFT JOIN customers c ON bl.customer_id = c.id
+                 LEFT JOIN users u ON bl.employee_id = u.id
+                 WHERE bl.id = ?
+                 LIMIT 1";
+    $loan_stmt = mysqli_prepare($conn, $loan_sql);
+    if (!$loan_stmt) {
+        echo json_encode(['success' => false, 'message' => 'Database error: ' . mysqli_error($conn)]);
+        exit();
+    }
+    mysqli_stmt_bind_param($loan_stmt, 'i', $loan_id);
+    mysqli_stmt_execute($loan_stmt);
+    $loan_result = mysqli_stmt_get_result($loan_stmt);
+    $loan = mysqli_fetch_assoc($loan_result);
+
+    if (!$loan) {
+        echo json_encode(['success' => false, 'message' => 'Loan details not found']);
+        exit();
+    }
+
+    $items = [];
+    $item_sql = "SELECT id, jewel_name, karat, defect_details, stone_details, net_weight, quantity, photo_path
+                 FROM bank_loan_items
+                 WHERE bank_loan_id = ?
+                 ORDER BY id ASC";
+    $item_stmt = mysqli_prepare($conn, $item_sql);
+    if ($item_stmt) {
+        mysqli_stmt_bind_param($item_stmt, 'i', $loan_id);
+        mysqli_stmt_execute($item_stmt);
+        $item_result = mysqli_stmt_get_result($item_stmt);
+        while ($row = mysqli_fetch_assoc($item_result)) {
+            $items[] = $row;
+        }
+    }
+
+    $emis = [];
+    $emi_sql = "SELECT installment_no, due_date, principal_amount, interest_amount, emi_amount, balance_amount, status, paid_date, paid_amount, payment_method, remarks
+                FROM bank_loan_emi
+                WHERE bank_loan_id = ?
+                ORDER BY installment_no ASC";
+    $emi_stmt = mysqli_prepare($conn, $emi_sql);
+    if ($emi_stmt) {
+        mysqli_stmt_bind_param($emi_stmt, 'i', $loan_id);
+        mysqli_stmt_execute($emi_stmt);
+        $emi_result = mysqli_stmt_get_result($emi_stmt);
+        while ($row = mysqli_fetch_assoc($emi_result)) {
+            $emis[] = $row;
+        }
+    }
+
+    $payments = [];
+    $payment_sql = "SELECT receipt_number, payment_date, payment_amount, payment_method, remarks, created_at
+                    FROM bank_loan_payments
+                    WHERE bank_loan_id = ?
+                    ORDER BY id DESC";
+    $payment_stmt = mysqli_prepare($conn, $payment_sql);
+    if ($payment_stmt) {
+        mysqli_stmt_bind_param($payment_stmt, 'i', $loan_id);
+        mysqli_stmt_execute($payment_stmt);
+        $payment_result = mysqli_stmt_get_result($payment_stmt);
+        while ($row = mysqli_fetch_assoc($payment_result)) {
+            $payments[] = $row;
+        }
+    }
+
+    echo json_encode([
+        'success' => true,
+        'loan' => $loan,
+        'items' => $items,
+        'emis' => $emis,
+        'payments' => $payments
+    ]);
+    exit();
+}
+
 // ============== END AJAX HANDLER ==============
 
 $message = '';
@@ -222,7 +319,7 @@ if (mysqli_num_rows($table_check) == 0) {
 
 if ($tables_created) {
     // Refresh the page to show new tables
-    header('Location: bank-loan.php');
+    header('Location: ' . $selfPage);
     exit();
 }
 
@@ -464,7 +561,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         
                         mysqli_commit($conn);
                         
-                        header('Location: bank-loan.php?success=created&ref=' . urlencode($loan_reference));
+                        header('Location: ' . $selfPage . '?success=created&ref=' . urlencode($loan_reference));
                         exit();
                         
                     } catch (Exception $e) {
@@ -565,7 +662,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     mysqli_commit($conn);
                     
-                    header('Location: bank-loan.php?success=payment_made&receipt=' . urlencode($receipt_no));
+                    header('Location: ' . $selfPage . '?success=payment_made&receipt=' . urlencode($receipt_no));
                     exit();
                     
                 } catch (Exception $e) {
@@ -1773,10 +1870,22 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
                     <div class="table-card">
                         <div class="table-header">
                             <span class="table-title">Bank Loans List</span>
-                            <span class="text-muted">Total: <?php echo $loans_result ? mysqli_num_rows($loans_result) : 0; ?> loans</span>
+                            <div style="display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-left:auto;">
+                                <input
+                                    type="text"
+                                    id="loanSearchInput"
+                                    class="form-control"
+                                    placeholder="Search Loan Ref / Date / Bank / Customer / Loan Amount"
+                                    style="min-width: 280px; max-width: 360px;"
+                                    onkeyup="filterBankLoans()"
+                                >
+                                <span class="text-muted" id="loanSearchCount">
+                                    Showing: <?php echo $loans_result ? mysqli_num_rows($loans_result) : 0; ?>/<?php echo $loans_result ? mysqli_num_rows($loans_result) : 0; ?>
+                                </span>
+                            </div>
                         </div>
                         <div class="table-responsive">
-                            <table class="loan-table">
+                            <table class="loan-table" id="bankLoansTable">
                                 <thead>
                                     <tr>
                                         <th>Loan Ref</th>
@@ -1793,7 +1902,7 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
                                         <th>Actions</th>
                                     </tr>
                                 </thead>
-                                <tbody>
+                                <tbody id="bankLoansTableBody">
                                     <?php 
                                     if ($loans_result && mysqli_num_rows($loans_result) > 0) {
                                         mysqli_data_seek($loans_result, 0);
@@ -1802,7 +1911,7 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
                                             $total_emis = intval($loan['total_emis'] ?? 0);
                                             $progress = $total_emis > 0 ? ($paid_emis / $total_emis) * 100 : 0;
                                     ?>
-                                    <tr>
+                                    <tr class="loan-row">
                                         <td><strong><?php echo htmlspecialchars($loan['loan_reference'] ?? ''); ?></strong></td>
                                         <td><?php echo date('d-m-Y', strtotime($loan['loan_date'] ?? date('Y-m-d'))); ?></td>
                                         <td><?php echo htmlspecialchars($loan['bank_short_name'] ?? ''); ?></td>
@@ -1927,7 +2036,7 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
             <span class="modal-close" onclick="closeViewModal()">&times;</span>
             <h3 class="modal-title">Loan Details</h3>
             <div id="loanDetails" class="alert alert-info">
-                <p>View details feature coming soon.</p>
+                <p>Loading loan details...</p>
             </div>
         </div>
     </div>
@@ -1972,7 +2081,7 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
             }).then((result) => {
                 if (result.isConfirmed) {
                     // Stay on bank loan page (already here)
-                    window.location.href = 'bank-loan.php';
+                    window.location.href = <?php echo json_encode($selfPage); ?>;
                 } else if (result.isDismissed) {
                     // Stay on current page to create another loan
                     // Form will still be visible
@@ -2268,6 +2377,58 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
             return num.toFixed(2).replace(/\d(?=(\d{3})+\.)/g, '$&,');
         }
 
+        // Live search for bank loan table
+        function filterBankLoans() {
+            const input = document.getElementById('loanSearchInput');
+            const tbody = document.getElementById('bankLoansTableBody');
+            const counter = document.getElementById('loanSearchCount');
+
+            if (!input || !tbody) return;
+
+            const filter = input.value.toLowerCase().trim();
+            const rows = tbody.querySelectorAll('tr.loan-row');
+            let visibleCount = 0;
+
+            rows.forEach(row => {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 5) return;
+
+                const refText = (cells[0].innerText || cells[0].textContent || '').toLowerCase();
+                const dateText = (cells[1].innerText || cells[1].textContent || '').toLowerCase();
+                const bankText = (cells[2].innerText || cells[2].textContent || '').toLowerCase();
+                const customerText = (cells[3].innerText || cells[3].textContent || '').toLowerCase();
+                const amountText = (cells[4].innerText || cells[4].textContent || '').toLowerCase().replace(/₹|,|\s/g, '');
+
+                const combined = [refText, dateText, bankText, customerText, amountText].join(' ');
+                const normalizedFilter = filter.replace(/₹|,|\s/g, '');
+
+                const matches = filter === '' || combined.includes(filter) || amountText.includes(normalizedFilter);
+                row.style.display = matches ? '' : 'none';
+
+                if (matches) visibleCount++;
+            });
+
+            let noResultRow = document.getElementById('loanSearchNoResult');
+            if (visibleCount === 0 && rows.length > 0) {
+                if (!noResultRow) {
+                    noResultRow = document.createElement('tr');
+                    noResultRow.id = 'loanSearchNoResult';
+                    noResultRow.innerHTML = '<td colspan="12" class="text-center" style="padding: 30px; color: #718096;">No matching bank loans found</td>';
+                    tbody.appendChild(noResultRow);
+                }
+            } else if (noResultRow) {
+                noResultRow.remove();
+            }
+
+            if (counter) {
+                counter.textContent = 'Showing: ' + visibleCount + '/' + rows.length;
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            filterBankLoans();
+        });
+
         // Add new row to jewelry table
         function addRow() {
             rowCount++;
@@ -2471,8 +2632,203 @@ if ($emi_summary_result && mysqli_num_rows($emi_summary_result) > 0) {
         }
 
         // View Loan Details
+        function formatCurrency(amount) {
+            const value = parseFloat(amount || 0);
+            return '₹' + value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text == null ? '' : String(text);
+            return div.innerHTML;
+        }
+
         function viewLoanDetails(loanId) {
-            document.getElementById('viewModal').classList.add('active');
+            const modal = document.getElementById('viewModal');
+            const detailsBox = document.getElementById('loanDetails');
+            modal.classList.add('active');
+            detailsBox.className = 'alert alert-info';
+            detailsBox.innerHTML = '<p>Loading loan details...</p>';
+
+            const url = window.location.href.split('?')[0] + '?ajax=get_loan_details&loan_id=' + encodeURIComponent(loanId);
+
+            fetch(url)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Unable to load loan details. Status: ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (!data.success || !data.loan) {
+                        throw new Error(data.message || 'Loan details not found');
+                    }
+
+                    const loan = data.loan;
+                    const items = Array.isArray(data.items) ? data.items : [];
+                    const emis = Array.isArray(data.emis) ? data.emis : [];
+                    const payments = Array.isArray(data.payments) ? data.payments : [];
+
+                    let itemsHtml = '<p style="margin:0;color:#718096;">No jewellery items found.</p>';
+                    if (items.length) {
+                        itemsHtml = `
+                            <div style="overflow-x:auto;">
+                                <table class="emi-table">
+                                    <thead>
+                                        <tr>
+                                            <th>#</th>
+                                            <th>Jewel Name</th>
+                                            <th>Karat</th>
+                                            <th>Net Weight</th>
+                                            <th>Qty</th>
+                                            <th>Defect</th>
+                                            <th>Stone</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${items.map((item, index) => `
+                                            <tr>
+                                                <td>${index + 1}</td>
+                                                <td>${escapeHtml(item.jewel_name || '-')}</td>
+                                                <td>${escapeHtml(item.karat || '-')}</td>
+                                                <td>${escapeHtml(item.net_weight || '0')}</td>
+                                                <td>${escapeHtml(item.quantity || '1')}</td>
+                                                <td>${escapeHtml(item.defect_details || '-')}</td>
+                                                <td>${escapeHtml(item.stone_details || '-')}</td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>`;
+                    }
+
+                    let emiHtml = '<p style="margin:0;color:#718096;">No EMI schedule found.</p>';
+                    if (emis.length) {
+                        emiHtml = `
+                            <div style="overflow-x:auto;max-height:260px;">
+                                <table class="emi-table">
+                                    <thead>
+                                        <tr>
+                                            <th>No</th>
+                                            <th>Due Date</th>
+                                            <th>Principal</th>
+                                            <th>Interest</th>
+                                            <th>EMI</th>
+                                            <th>Status</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${emis.map(emi => `
+                                            <tr>
+                                                <td>${escapeHtml(emi.installment_no || '')}</td>
+                                                <td>${escapeHtml(emi.due_date || '-')}</td>
+                                                <td>${formatCurrency(emi.principal_amount)}</td>
+                                                <td>${formatCurrency(emi.interest_amount)}</td>
+                                                <td>${formatCurrency(emi.emi_amount)}</td>
+                                                <td><span class="status-badge ${String(emi.status || '').toLowerCase() === 'paid' ? 'status-paid' : 'status-pending'}">${escapeHtml(emi.status || '-')}</span></td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>`;
+                    }
+
+                    let paymentHtml = '<p style="margin:0;color:#718096;">No payments made yet.</p>';
+                    if (payments.length) {
+                        paymentHtml = `
+                            <div style="overflow-x:auto;max-height:220px;">
+                                <table class="emi-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Receipt</th>
+                                            <th>Date</th>
+                                            <th>Amount</th>
+                                            <th>Method</th>
+                                            <th>Remarks</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${payments.map(payment => `
+                                            <tr>
+                                                <td>${escapeHtml(payment.receipt_number || '-')}</td>
+                                                <td>${escapeHtml(payment.payment_date || '-')}</td>
+                                                <td>${formatCurrency(payment.payment_amount)}</td>
+                                                <td>${escapeHtml(payment.payment_method || '-')}</td>
+                                                <td>${escapeHtml(payment.remarks || '-')}</td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>`;
+                    }
+
+                    detailsBox.className = '';
+                    detailsBox.innerHTML = `
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:18px;">
+                            <div class="stat-card" style="padding:14px;box-shadow:none;border:1px solid #e2e8f0;">
+                                <div class="stat-content">
+                                    <div class="stat-label">Loan Ref</div>
+                                    <div class="stat-value" style="font-size:18px;">${escapeHtml(loan.loan_reference || '-')}</div>
+                                    <div class="stat-sub">Status: ${escapeHtml(loan.status || '-')}</div>
+                                </div>
+                            </div>
+                            <div class="stat-card" style="padding:14px;box-shadow:none;border:1px solid #e2e8f0;">
+                                <div class="stat-content">
+                                    <div class="stat-label">Customer</div>
+                                    <div class="stat-value" style="font-size:18px;">${escapeHtml(loan.customer_name || '-')}</div>
+                                    <div class="stat-sub">${escapeHtml(loan.mobile_number || '-')}</div>
+                                </div>
+                            </div>
+                            <div class="stat-card" style="padding:14px;box-shadow:none;border:1px solid #e2e8f0;">
+                                <div class="stat-content">
+                                    <div class="stat-label">Loan Amount</div>
+                                    <div class="stat-value" style="font-size:18px;">${formatCurrency(loan.loan_amount)}</div>
+                                    <div class="stat-sub">EMI: ${formatCurrency(loan.emi_amount)}</div>
+                                </div>
+                            </div>
+                            <div class="stat-card" style="padding:14px;box-shadow:none;border:1px solid #e2e8f0;">
+                                <div class="stat-content">
+                                    <div class="stat-label">Bank</div>
+                                    <div class="stat-value" style="font-size:18px;">${escapeHtml(loan.bank_full_name || loan.bank_short_name || '-')}</div>
+                                    <div class="stat-sub">Tenure: ${escapeHtml(loan.tenure_months || '0')} months</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="form-card" style="padding:16px;box-shadow:none;border:1px solid #e2e8f0;margin-bottom:16px;">
+                            <div class="form-title" style="font-size:16px;margin-bottom:12px;">Loan Information</div>
+                            <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:0;">
+                                <div><strong>Loan Date:</strong><br>${escapeHtml(loan.loan_date || '-')}</div>
+                                <div><strong>Interest Rate:</strong><br>${escapeHtml(loan.interest_rate || '0')}%</div>
+                                <div><strong>Total Interest:</strong><br>${formatCurrency(loan.total_interest)}</div>
+                                <div><strong>Total Payable:</strong><br>${formatCurrency(loan.total_payable)}</div>
+                                <div><strong>Document Charge:</strong><br>${formatCurrency(loan.document_charge)}</div>
+                                <div><strong>Processing Fee:</strong><br>${formatCurrency(loan.processing_fee)}</div>
+                                <div><strong>Product Type:</strong><br>${escapeHtml(loan.product_type || '-')}</div>
+                                <div><strong>Employee:</strong><br>${escapeHtml(loan.employee_name || '-')}</div>
+                            </div>
+                            <div style="margin-top:12px;"><strong>Remarks:</strong><br>${escapeHtml(loan.remarks || '-')}</div>
+                        </div>
+
+                        <div class="form-card" style="padding:16px;box-shadow:none;border:1px solid #e2e8f0;margin-bottom:16px;">
+                            <div class="form-title" style="font-size:16px;margin-bottom:12px;">Jewellery Items</div>
+                            ${itemsHtml}
+                        </div>
+
+                        <div class="form-card" style="padding:16px;box-shadow:none;border:1px solid #e2e8f0;margin-bottom:16px;">
+                            <div class="form-title" style="font-size:16px;margin-bottom:12px;">EMI Schedule</div>
+                            ${emiHtml}
+                        </div>
+
+                        <div class="form-card" style="padding:16px;box-shadow:none;border:1px solid #e2e8f0;margin-bottom:0;">
+                            <div class="form-title" style="font-size:16px;margin-bottom:12px;">Payment History</div>
+                            ${paymentHtml}
+                        </div>`;
+                })
+                .catch(error => {
+                    detailsBox.className = 'alert alert-error';
+                    detailsBox.innerHTML = '<p>' + escapeHtml(error.message || 'Unable to load loan details') + '</p>';
+                });
         }
 
         function closeViewModal() {

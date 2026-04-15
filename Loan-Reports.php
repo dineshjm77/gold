@@ -4,7 +4,7 @@ $currentPage = 'loan-reports';
 $pageTitle = 'Loan Reports';
 require_once 'includes/db.php';
 require_once 'auth_check.php';
-
+    
 // Enable error reporting for debugging
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
