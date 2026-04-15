@@ -6,29 +6,15 @@ session_start();
 $currentPage = 'expense-details';
 $pageTitle = 'Expense Details';
 
-// Main database connection (u983225556_pawntrading)
+// Database connection
 require_once 'includes/db.php';
 
 // Check if main connection exists
 if (!isset($conn) || !($conn instanceof mysqli)) {
-    die("Main database connection failed: " . mysqli_connect_error());
+    die("Database connection failed: " . mysqli_connect_error());
 }
 
-// Second database connection for u983225556_pawngold
-$pawngold_host = 'localhost';
-$pawngold_user = 'u983225556_pawntrading';
-$pawngold_pass = 'Ariharan@2025';
-$pawngold_db = 'u983225556_pawntrading';
-
-$pawngold_conn = new mysqli($pawngold_host, $pawngold_user, $pawngold_pass, $pawngold_db);
-
-if ($pawngold_conn->connect_error) {
-    // Log error but don't die - we'll handle gracefully
-    error_log("Connection to pawngold database failed: " . $pawngold_conn->connect_error);
-    $pawngold_conn = null;
-} else {
-    $pawngold_conn->set_charset("utf8mb4");
-}
+$conn->set_charset("utf8mb4");
 
 // Check authentication
 if (!file_exists('auth_check.php')) {
@@ -97,9 +83,9 @@ if (!$amount_check || $amount_check->num_rows == 0) {
     $conn->query($alter_amount);
 }
 
-// Check if company_expenses table exists in pawngold database
-if ($pawngold_conn) {
-    $check_company_expenses = $pawngold_conn->query("SHOW TABLES LIKE 'company_expenses'");
+// Check if company_expenses table exists in current database
+if ($conn) {
+    $check_company_expenses = $conn->query("SHOW TABLES LIKE 'company_expenses'");
     if ($check_company_expenses && $check_company_expenses->num_rows == 0) {
         // Create company_expenses table if it doesn't exist
         $create_company_expenses = "CREATE TABLE IF NOT EXISTS `company_expenses` (
@@ -119,7 +105,7 @@ if ($pawngold_conn) {
             KEY `idx_ce_created` (`created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci";
         
-        $pawngold_conn->query($create_company_expenses);
+        $conn->query($create_company_expenses);
     }
 }
 
@@ -168,14 +154,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             if ($stmt->execute()) {
                                 $new_id = $conn->insert_id;
                                 
-                                // Insert into company_expenses table (pawngold database) for all expenses
-                                if ($amount > 0 && $pawngold_conn) {
+                                // Insert into company_expenses table in current database for all expenses
+                                if ($amount > 0 && $conn) {
                                     // Insert into company_expenses with fixed company_id = 4
                                     $company_expense_query = "INSERT INTO company_expenses 
                                                              (company_id, amount, expense_date, category, method, reference_no, note, created_by, created_at) 
                                                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())";
                                     
-                                    $company_stmt = $pawngold_conn->prepare($company_expense_query);
+                                    $company_stmt = $conn->prepare($company_expense_query);
                                     if ($company_stmt) {
                                         // Use receipt number as reference
                                         $reference_no = "REC-{$receipt_number}";
@@ -275,11 +261,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             
                             if ($stmt->execute()) {
                                 // If amount changed, update company_expenses
-                                if ($amount != $old_amount && $pawngold_conn) {
+                                if ($amount != $old_amount && $conn) {
                                     $reference_no = "REC-{$receipt_number}";
                                     
                                     // Check if record exists in company_expenses
-                                    $check_company = $pawngold_conn->prepare("SELECT id FROM company_expenses WHERE reference_no = ?");
+                                    $check_company = $conn->prepare("SELECT id FROM company_expenses WHERE reference_no = ?");
                                     if ($check_company) {
                                         $check_company->bind_param("s", $reference_no);
                                         $check_company->execute();
@@ -288,7 +274,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         
                                         if ($company_exists) {
                                             // Update existing record
-                                            $update_company = $pawngold_conn->prepare("UPDATE company_expenses 
+                                            $update_company = $conn->prepare("UPDATE company_expenses 
                                                                                      SET amount = ?, expense_date = ?, category = ?, method = ?, note = ? 
                                                                                      WHERE reference_no = ?");
                                             if ($update_company) {
@@ -299,7 +285,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                             }
                                         } else if ($amount > 0) {
                                             // Insert new record if amount > 0
-                                            $insert_company = $pawngold_conn->prepare("INSERT INTO company_expenses 
+                                            $insert_company = $conn->prepare("INSERT INTO company_expenses 
                                                                                      (company_id, amount, expense_date, category, method, reference_no, note, created_by, created_at) 
                                                                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())");
                                             if ($insert_company) {
@@ -360,10 +346,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $receipt_number = isset($receipt_data['receipt_number']) ? $receipt_data['receipt_number'] : 0;
                     $receipt_stmt->close();
                     
-                    if ($receipt_number > 0 && $pawngold_conn) {
-                        // Delete from company_expenses in pawngold database
+                    if ($receipt_number > 0 && $conn) {
+                        // Delete from company_expenses in current database
                         $reference_no = "REC-{$receipt_number}";
-                        $delete_company = $pawngold_conn->prepare("DELETE FROM company_expenses WHERE reference_no = ?");
+                        $delete_company = $conn->prepare("DELETE FROM company_expenses WHERE reference_no = ?");
                         if ($delete_company) {
                             $delete_company->bind_param("s", $reference_no);
                             $delete_company->execute();
@@ -457,10 +443,10 @@ if ($expense_result && $expense_result->num_rows == 0) {
                     $insert->close();
                     
                     // Also insert into company_expenses for all entries
-                    if ($data[5] > 0 && $pawngold_conn) {
+                    if ($data[5] > 0 && $conn) {
                         $reference_no = "REC-{$data[0]}";
                         $note = "Expense: {$data[2]} - {$data[3]}";
-                        $company_insert = $pawngold_conn->prepare("INSERT INTO company_expenses 
+                        $company_insert = $conn->prepare("INSERT INTO company_expenses 
                                                                  (company_id, amount, expense_date, category, method, reference_no, note, created_by, created_at) 
                                                                  VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW())");
                         if ($company_insert) {
